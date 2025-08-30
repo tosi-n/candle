@@ -145,7 +145,7 @@ pub fn denoise_kontext<M: super::WithForward>(
             _ => continue,
         };
         
-        // Concatenate generation latents with static image latents (like mflux)
+        // Concatenate generation latents with static image latents
         let concatenated_img = Tensor::cat(&[&img, static_image_latents], 1)?;
         
         let t_vec = Tensor::full(*t_curr as f32, b_sz, dev)?;
@@ -160,7 +160,7 @@ pub fn denoise_kontext<M: super::WithForward>(
             Some(kontext_image_ids)
         )?;
         
-        // Extract only the noise for generation latents (first part, like mflux line 105)
+        // Extract only the noise for generation latents (first part)
         let generation_pred = pred.i((.., ..original_img_len))?;
         
         // Update only the generation latents
@@ -169,7 +169,7 @@ pub fn denoise_kontext<M: super::WithForward>(
     Ok(img)
 }
 
-/// Create image IDs for Kontext conditioning (based on mflux implementation)
+/// Create image IDs for Kontext conditioning
 /// This creates positional embeddings for the conditioning image
 pub fn create_kontext_image_ids(
     height: usize,

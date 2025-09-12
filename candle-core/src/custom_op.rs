@@ -381,12 +381,12 @@ pub struct UgIOp1 {
     #[cfg(feature = "cuda")]
     func: cudarc::driver::CudaFunction,
     #[cfg(feature = "metal")]
-    func: candle_metal_kernels::metal_utils::ComputePipeline,
+    func: candle_metal_kernels::metal::ComputePipeline,
 }
 
 impl UgIOp1 {
     #[allow(unused)]
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
     pub fn new(
         name: &'static str,
         kernel: ug::lang::ssa::Kernel,

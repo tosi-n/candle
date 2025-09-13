@@ -91,28 +91,28 @@ impl Module for Qwen3MLP {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Qwen3Attention {
+pub struct Qwen3Attention {
     // projections
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
     // norms
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    pub q_norm: RmsNorm,
+    pub k_norm: RmsNorm,
     // hyper params
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    hidden_size: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub num_kv_groups: usize,
+    pub head_dim: usize,
+    pub hidden_size: usize,
     // utils
-    rotary_emb: Arc<Qwen3RotaryEmbedding>,
-    kv_cache: KvCache,
+    pub rotary_emb: Arc<Qwen3RotaryEmbedding>,
+    pub kv_cache: KvCache,
 }
 
 impl Qwen3Attention {
-    pub(crate) fn new(
+    pub fn new(
         cfg: &Config,
         rotary_emb: Arc<Qwen3RotaryEmbedding>,
         vb: VarBuilder,
@@ -178,7 +178,7 @@ impl Qwen3Attention {
         })
     }
 
-    pub(crate) fn forward(
+    pub fn forward(
         &mut self,
         x: &Tensor,
         attn_mask: Option<&Tensor>,
@@ -235,21 +235,21 @@ impl Qwen3Attention {
             .apply(&self.o_proj)
     }
 
-    pub(crate) fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
     }
 }
 
 #[derive(Debug, Clone)]
-struct DecoderLayer {
-    self_attn: Qwen3Attention,
-    mlp: Qwen3MLP,
-    ln1: RmsNorm,
-    ln2: RmsNorm,
+pub struct DecoderLayer {
+    pub self_attn: Qwen3Attention,
+    pub mlp: Qwen3MLP,
+    pub ln1: RmsNorm,
+    pub ln2: RmsNorm,
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
         let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
         let mlp = Qwen3MLP::new(cfg, vb.pp("mlp"))?;
         let ln1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -266,7 +266,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
         let h = self.self_attn.forward(&h, mask, offset)?;
         let x = (x + h)?;
@@ -275,18 +275,18 @@ impl DecoderLayer {
         x + h2
     }
 
-    fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: candle_nn::Embedding,
-    layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
-    device: Device,
-    dtype: DType,
+    pub embed_tokens: candle_nn::Embedding,
+    pub layers: Vec<DecoderLayer>,
+    pub norm: RmsNorm,
+    pub device: Device,
+    pub dtype: DType,
 }
 
 impl Model {
@@ -308,7 +308,7 @@ impl Model {
         })
     }
 
-    fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         for l in &mut self.layers {
             l.clear_kv_cache();
         }
@@ -360,8 +360,8 @@ impl Model {
 
 #[derive(Debug, Clone)]
 pub struct ModelForCausalLM {
-    base: Model,
-    lm_head: Linear,
+    pub base: Model,
+    pub lm_head: Linear,
 }
 
 impl ModelForCausalLM {

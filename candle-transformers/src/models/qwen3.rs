@@ -350,7 +350,7 @@ impl DecoderLayer {
         let x = (x + h)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
-        Ok(x + h2)
+        Ok((x + h2)?)
     }
 }
 

@@ -14,6 +14,7 @@ pub struct Config {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub head_dim: usize,
+    #[serde(alias = "qkv_bias")]
     pub attention_bias: bool,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,

@@ -376,6 +376,7 @@ impl Tensor {
     }
 }
 
+#[cfg(feature = "ug")]
 pub struct UgIOp1 {
     name: &'static str,
     #[cfg(feature = "cuda")]
@@ -384,12 +385,13 @@ pub struct UgIOp1 {
     func: candle_metal_kernels::metal::ComputePipeline,
 }
 
+#[cfg(feature = "ug")]
 impl UgIOp1 {
     #[allow(unused)]
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
     pub fn new(
         name: &'static str,
-        kernel: ug::lang::ssa::Kernel,
+        kernel: candle_ug::lang::ssa::Kernel,
         device: &crate::Device,
     ) -> Result<Self> {
         #[cfg(feature = "cuda")]
@@ -414,6 +416,7 @@ impl UgIOp1 {
     }
 }
 
+#[cfg(feature = "ug")]
 impl InplaceOp1 for UgIOp1 {
     fn name(&self) -> &'static str {
         self.name
@@ -426,7 +429,6 @@ impl InplaceOp1 for UgIOp1 {
     #[cfg(feature = "metal")]
     fn metal_fwd(&self, sto: &mut MetalStorage, layout: &Layout) -> Result<()> {
         use crate::backend::BackendStorage;
-        use candle_metal_kernels::utils::EncoderProvider;
         use objc2_metal;
 
         let elem_count = layout.shape().elem_count();
@@ -435,13 +437,9 @@ impl InplaceOp1 for UgIOp1 {
             crate::bail!("input is not a f32 tensor")
         }
         let device = sto.device();
-        println!("here");
-        let command_buffer = device.command_buffer()?;
-        let command_buffer = &command_buffer;
-        let encoder = command_buffer.encoder();
-        let encoder = encoder.as_ref();
+        let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.func);
-        let (g, b) = if elem_count % 32 == 0 {
+        let (g, b) = if elem_count.is_multiple_of(32) {
             (elem_count / 32, 32)
         } else {
             (elem_count, 1)
@@ -452,7 +450,7 @@ impl InplaceOp1 for UgIOp1 {
             depth: 1,
         };
         let group_dims = candle_metal_kernels::utils::get_block_dims(b, 1, 1);
-        candle_metal_kernels::utils::set_param(encoder, 0, (sto.buffer(), 0usize));
+        candle_metal_kernels::utils::set_param(&encoder, 0, (sto.buffer(), 0usize));
 
         encoder.use_resource(sto.buffer(), objc2_metal::MTLResourceUsage::Write);
         encoder.dispatch_threads(grid_dims, group_dims);

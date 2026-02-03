@@ -219,6 +219,26 @@ fn asort(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Test sorting a large tensor that exceeds 1024 elements.
+fn asort_big(device: &Device) -> Result<()> {
+    // Skip on metal for now
+    if device.is_metal() {
+        return Ok(());
+    }
+    const SIZE: usize = 2000;
+    let data: Vec<f32> = (0..SIZE).map(|x| (SIZE - x) as f32).collect();
+    let tensor = Tensor::new(data.as_slice(), device)?;
+
+    let indexes = tensor.arg_sort_last_dim(true)?;
+    let expected_indexes: Vec<u32> = (0..SIZE).rev().map(|x| x as u32).collect();
+    assert_eq!(indexes.to_vec1::<u32>()?, expected_indexes);
+
+    let indexes = tensor.arg_sort_last_dim(false)?;
+    let expected_indexes: Vec<u32> = (0..SIZE).map(|x| x as u32).collect();
+    assert_eq!(indexes.to_vec1::<u32>()?, expected_indexes);
+    Ok(())
+}
+
 fn unary_op(device: &Device) -> Result<()> {
     let data = &[[-3f32, 1., 4., -0.1, 0.5], [2.7, -1.8, -0.28, 1.8, 2.8]];
     let tensor = Tensor::new(data, device)?;
@@ -324,6 +344,21 @@ fn binary_op(device: &Device) -> Result<()> {
         max.to_vec2::<f32>()?,
         [[3.0, 2.5, 4.0, 2.5, 5.0], [2.0, 1.0, 7.0, 8.0, 2.0]]
     );
+    Ok(())
+}
+
+fn ternary_op(device: &Device) -> Result<()> {
+    let data = &[[0u8, 1, 0, 1, 0], [1, 1, 1, 0, 0]];
+    let ids = Tensor::new(data, device)?;
+    let data = &[[0f32, 1., 2., 3., 4.], [5., 6., 7., 8., 9.]];
+    let a = Tensor::new(data, device)?;
+    let data = &[[10f32, 11., 12., 13., 14.], [15., 16., 17., 18., 19.]];
+    let b = Tensor::new(data, device)?;
+    let tensor = ids.where_cond(&a, &b)?;
+    let dims = tensor.dims();
+    assert_eq!(dims, [2, 5]);
+    let result: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
+    assert_eq!(result, [10., 1., 12., 3., 14., 5., 6., 7., 18., 19.]);
     Ok(())
 }
 
@@ -1665,6 +1700,7 @@ test_device!(argmin, argmin_cpu, argmin_gpu, argmin_metal);
 test_device!(transpose, transpose_cpu, transpose_gpu, transpose_metal);
 test_device!(unary_op, unary_op_cpu, unary_op_gpu, unary_op_metal);
 test_device!(binary_op, binary_op_cpu, binary_op_gpu, binary_op_metal);
+test_device!(ternary_op, ternary_op_cpu, ternary_op_gpu, ternary_op_metal);
 test_device!(embeddings, embeddings_cpu, embeddings_gpu, embeddings_metal);
 test_device!(cmp, cmp_cpu, cmp_gpu, cmp_metal);
 test_device!(
@@ -1691,6 +1727,7 @@ test_device!(
 test_device!(randn, randn_cpu, randn_gpu, randn_metal);
 test_device!(clamp, clamp_cpu, clamp_gpu, clamp_metal);
 test_device!(asort, asort_cpu, asort_gpu, asort_metal);
+test_device!(asort_big, asort_big_cpu, asort_big_gpu, asort_big_metal);
 test_device!(var, var_cpu, var_gpu, var_metal);
 test_device!(zero_dim, zero_dim_cpu, zero_dim_gpu, zero_dim_metal);
 
@@ -1705,6 +1742,21 @@ fn tensor_send_sync(device: &Device) -> Result<()> {
             assert_eq!(result, vec![2.0f32, 4.0, 6.0]);
         });
     }
+    let result: Vec<f32> = tensor.to_vec1().unwrap();
+    assert_eq!(result, vec![1.0f32, 2.0, 3.0]);
+
+    let tensor = Tensor::new(vec![1.0f32, 2.0, 3.0], device)?;
+    tensor.device().synchronize().unwrap();
+
+    let new = std::thread::spawn(move || {
+        let new = tensor.add(&tensor).unwrap();
+        new.device().synchronize().unwrap();
+        new
+    })
+    .join()
+    .unwrap();
+    let result: Vec<f32> = new.to_vec1().unwrap();
+    assert_eq!(result, vec![2.0f32, 4.0, 6.0]);
 
     Ok(())
 }
@@ -1944,5 +1996,67 @@ fn tensor_norm() -> Result<()> {
     let t = Tensor::new(&[[3., 4.], [0., 0.]], &Device::Cpu)?;
     let norm = t.norm()?;
     assert_eq!(norm.to_scalar::<f64>()?, 5.);
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn transfers_cuda_to_device() -> Result<()> {
+    use rand::seq::SliceRandom;
+
+    let devices = cudarc::driver::safe::CudaContext::device_count()
+        .map_err(candle_core::cuda::CudaError::from)?;
+    if devices < 2 {
+        return Ok(());
+    }
+    let first = Device::new_cuda(0)?;
+
+    let mut data: Vec<u32> = (0..262144).collect();
+    let mut rng = rand::rng();
+    data.shuffle(&mut rng);
+
+    let t1 = Tensor::from_vec(data, (512, 512), &first)?;
+    let second = Device::new_cuda(1)?;
+    let t2 = t1.to_device(&second)?;
+
+    assert_ne!(
+        t1.device().as_cuda_device()?.id(),
+        t2.device().as_cuda_device()?.id()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn allocates_twice_when_transferring_to_same_device() -> Result<()> {
+    use std::{ops::Deref, sync::RwLockReadGuard};
+
+    use candle_core::Storage;
+    use rand::seq::SliceRandom;
+
+    let first = Device::new_cuda(0)?;
+    let second = Device::new_cuda(0)?;
+
+    let mut data: Vec<u32> = (0..262144).collect();
+    let mut rng = rand::rng();
+    data.shuffle(&mut rng);
+
+    let t1 = Tensor::from_vec(data, (512, 512), &first)?;
+    let t2 = t1.to_device(&second)?;
+
+    let (storage1, _) = t1.storage_and_layout();
+    let (storage2, _) = t2.storage_and_layout();
+    let extract = |s: RwLockReadGuard<'_, Storage>| match &s.deref() {
+        Storage::Cuda(c) => {
+            use cudarc::driver::DevicePtr;
+            let slice = c.as_cuda_slice::<u32>().unwrap();
+            let ptr = slice.device_ptr(slice.stream()).0;
+            ptr
+        }
+        _ => unimplemented!(),
+    };
+    let id1 = extract(storage1);
+    let id2 = extract(storage2);
+    assert_ne!(id1, id2);
     Ok(())
 }

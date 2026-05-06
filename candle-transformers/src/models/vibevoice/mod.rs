@@ -38,16 +38,19 @@
 //! - [`dpm_solver`]: complete (dpmsolver++/midpoint/v_prediction/cosine
 //!   path only — VibeVoice's exclusive configuration). Numerical match
 //!   against the Python reference still pending an end-to-end test.
-//! - [`tokenizer`]: skeleton only. Encoder/decoder bodies pending the
-//!   ~800–1000 LOC port plus checkpoint validation.
-//! - [`model`]: skeleton only. The full inference loop (Qwen forward →
-//!   diffusion → audio decode) lives in
-//!   `vibevoice/modular/modeling_vibevoice_streaming_inference.py`
-//!   upstream and lands as a follow-up commit.
+//! - [`tokenizer`]: complete encoder + decoder, smoke tested.
+//! - [`connectors`]: small `SpeechConnector` (Linear-RMSNorm-Linear)
+//!   used to project tokenizer latents into the LLM hidden space.
+//! - [`model`] + [`inference`]: end-to-end generate loop. Qwen2 LLM is
+//!   passed in by the caller (kept out of the model struct to allow
+//!   1.5B / 7B variants to share this port). Numerical validation
+//!   against the released checkpoint is a follow-up.
 
 pub mod config;
+pub mod connectors;
 pub mod diffusion_head;
 pub mod dpm_solver;
+pub mod inference;
 pub mod model;
 pub mod tokenizer;
 
@@ -55,7 +58,9 @@ pub use config::{
     VibeVoiceAcousticTokenizerConfig, VibeVoiceConfig, VibeVoiceDiffusionHeadConfig,
     VibeVoiceSemanticTokenizerConfig, VibeVoiceTokenizerConfig,
 };
+pub use connectors::SpeechConnector;
 pub use diffusion_head::VibeVoiceDiffusionHead;
 pub use dpm_solver::{BetaSchedule, DpmSolver, DpmSolverConfig, PredictionType};
-pub use model::VibeVoiceModel;
+pub use inference::{generate_audio, GenerateOutput};
+pub use model::{GenerateOptions, VibeVoiceModel};
 pub use tokenizer::{AcousticTokenizer, SemanticTokenizer};

@@ -354,11 +354,52 @@ impl Model {
                 }
             }
         };
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let xs = self.embed_tokens.forward(input_ids)?;
+        self.forward_with_embeds(&xs, seqlen_offset, attention_mask.as_ref())
+    }
+
+    /// Run the post-embedding decoder stack on a pre-built embedding tensor
+    /// of shape `(B, S, hidden_size)`. Useful for callers (e.g. VibeVoice) that
+    /// need to splice external features into the embeddings before the layers.
+    ///
+    /// `seqlen_offset` and `attention_mask` follow the same semantics as
+    /// [`Self::forward`].
+    pub fn forward_with_embeds(
+        &mut self,
+        inputs_embeds: &Tensor,
+        seqlen_offset: usize,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len, _) = inputs_embeds.dims3()?;
+        let attention_mask: Option<Tensor> = match attention_mask {
+            Some(mask) => Some(mask.clone()),
+            None => {
+                if seq_len <= 1 {
+                    None
+                } else {
+                    Some(self.prepare_causal_attention_mask(b_size, seq_len, seqlen_offset)?)
+                }
+            }
+        };
+        let mut xs = inputs_embeds.clone();
         for layer in self.layers.iter_mut() {
             xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
         }
         xs.apply(&self.norm)
+    }
+
+    /// Read-only accessor for the input-token embedding matrix. VibeVoice
+    /// uses this to embed text tokens out-of-band so it can splice in the
+    /// speaker conditioning embedding before running the layer stack.
+    pub fn embed_tokens(&self) -> &candle_nn::Embedding {
+        &self.embed_tokens
+    }
+
+    /// Hidden size of the underlying language model. Convenience for
+    /// callers that need to size auxiliary modules (e.g. VibeVoice's
+    /// speech connectors) without threading the [`Config`] through.
+    pub fn hidden_size(&self) -> usize {
+        self.embed_tokens.embeddings().dim(1).unwrap_or(0)
     }
 
     pub fn clear_kv_cache(&mut self) {

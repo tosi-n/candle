@@ -22,7 +22,7 @@
 //! formula `eps = eps_uncond + scale * (eps_cond - eps_uncond)`.
 
 use candle::{DType, Device, Result, Tensor, D};
-use candle_nn::{linear, Linear, Module, VarBuilder};
+use candle_nn::{linear_no_bias as linear, Linear, Module, VarBuilder};
 
 use super::config::VibeVoiceDiffusionHeadConfig;
 

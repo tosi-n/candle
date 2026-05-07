@@ -202,20 +202,26 @@ impl HeadLayer {
 /// Final layer that produces the noise/velocity prediction. Same AdaLN
 /// modulation pattern but only `(shift, scale)` — no FFN, just a direct
 /// linear projection from `hidden_size` to `latent_size`.
+///
+/// Note: VibeVoice's released `FinalLayer` ships a *weight-less*
+/// pre-norm (Python's `RMSNorm(..., elementwise_affine=False)`); only
+/// the `adaLN_modulation.1.weight` and `linear.weight` tensors appear
+/// under `model.prediction_head.final_layer.*` in the index. We mirror
+/// that by storing `rms_eps` and applying `rsqrt(mean(x², -1) + eps)`
+/// inline in `forward`, with no `RmsNorm::weight` to load.
 #[derive(Debug, Clone)]
 struct FinalLayer {
-    norm: RmsNorm,
+    rms_eps: f64,
     cond_proj: Linear,
     out_proj: Linear,
 }
 
 impl FinalLayer {
     fn new(hidden_size: usize, latent_size: usize, rms_eps: f64, vb: VarBuilder) -> Result<Self> {
-        let norm = RmsNorm::new(hidden_size, rms_eps, vb.pp("norm"))?;
         let cond_proj = linear(hidden_size, 2 * hidden_size, vb.pp("adaLN_modulation.1"))?;
         let out_proj = linear(hidden_size, latent_size, vb.pp("linear"))?;
         Ok(Self {
-            norm,
+            rms_eps,
             cond_proj,
             out_proj,
         })
@@ -227,7 +233,14 @@ impl FinalLayer {
         let chunks = proj.chunk(2, D::Minus1)?;
         let (shift, scale) = (&chunks[0], &chunks[1]);
 
-        let normalized = self.norm.forward(x)?;
+        // Weight-less RMSNorm: x * rsqrt(mean(x², dim=-1) + eps).
+        // Computed in f32 for numerical stability and cast back.
+        let in_dtype = x.dtype();
+        let xf = x.to_dtype(DType::F32)?;
+        let variance = xf.sqr()?.mean_keepdim(D::Minus1)?;
+        let inv_rms = (variance + self.rms_eps)?.sqrt()?.recip()?;
+        let normalized = xf.broadcast_mul(&inv_rms)?.to_dtype(in_dtype)?;
+
         let modulated = modulate(&normalized, shift, scale)?;
         self.out_proj.forward(&modulated)
     }

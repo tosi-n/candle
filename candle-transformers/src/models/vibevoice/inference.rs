@@ -146,6 +146,22 @@ pub fn generate_audio(
         // for the diffusion head. Shape: (1, hidden).
         let last_hidden = hidden.narrow(1, hidden.dim(1)? - 1, 1)?.squeeze(1)?;
 
+        // Debug helper: opt-in via `VIBEVOICE_DEBUG_GENERATE=1`. Prints
+        // mean/std of next_input + last_hidden + the eventual latent at
+        // each step so a failing autoregressive loop ("stuck on one
+        // token") is easy to diagnose.
+        let debug_loop = std::env::var("VIBEVOICE_DEBUG_GENERATE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if debug_loop && step_idx < 8 {
+            let ni_stats = tensor_mean_std(&next_input)?;
+            let lh_stats = tensor_mean_std(&last_hidden)?;
+            eprintln!(
+                "[vv.gen step={step_idx} offset={seqlen_offset}]  next_input μ={:+.4} σ={:.4}  last_hidden μ={:+.4} σ={:.4}",
+                ni_stats.0, ni_stats.1, lh_stats.0, lh_stats.1,
+            );
+        }
+
         // 3c — EOS check (vocab-token mode). Upstream's streaming variant
         // uses a binary classifier here; the spec opts for a configurable
         // token id via the lm_head. If both are wired we honour the
@@ -177,6 +193,14 @@ pub fn generate_audio(
             &device,
             dtype,
         )?;
+
+        if debug_loop && step_idx < 8 {
+            let lat_stats = tensor_mean_std(&latent)?;
+            eprintln!(
+                "[vv.gen step={step_idx}]  latent (pre-scale) μ={:+.4} σ={:.4}",
+                lat_stats.0, lat_stats.1,
+            );
+        }
 
         // 3e — invert the training-time scaling so the latent lives in
         // the acoustic decoder's expected range (model.py L326 inverse,
@@ -302,6 +326,17 @@ fn invert_scaling(latent: &Tensor, model: &VibeVoiceModel) -> Result<Tensor> {
     let bias = model.speech_bias_factor();
     let scaled = latent.broadcast_div(scaling)?;
     scaled.broadcast_sub(bias)
+}
+
+/// Cheap (mean, std) summary used by the optional debug logging. Both
+/// reductions go through f32 to avoid bf16 precision artifacts.
+fn tensor_mean_std(t: &Tensor) -> Result<(f32, f32)> {
+    let f = t.to_dtype(DType::F32)?.flatten_all()?;
+    let n = f.dim(0)? as f32;
+    let mean = f.sum(0)?.to_scalar::<f32>()? / n;
+    let centered = (f - mean as f64)?;
+    let var = (centered.sqr()?.sum(0)?.to_scalar::<f32>()?) / n;
+    Ok((mean, var.sqrt()))
 }
 
 /// Compute the per-call diffusion-step budget. Caller can pass an

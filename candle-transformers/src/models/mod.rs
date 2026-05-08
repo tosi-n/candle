@@ -70,6 +70,7 @@ pub mod mobileclip;
 pub mod mobilenetv4;
 pub mod mobileone;
 pub mod modernbert;
+pub mod openai_privacy_filter;
 pub mod moondream;
 pub mod mpt;
 pub mod nomic_bert;

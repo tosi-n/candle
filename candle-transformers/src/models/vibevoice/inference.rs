@@ -102,6 +102,29 @@ pub fn generate_audio(
     let lm_hidden = language_model.hidden_size();
     let vae_dim = model.acoustic_config().vae_dim;
 
+    // Diagnostic 1 — what did the loader produce for the σ-VAE scalars?
+    // If these read as exactly 1.0/0.0 or 1.0/-0.7 the buffer was
+    // NaN/missing in the checkpoint and we fell back to defaults. The
+    // released checkpoint stores trained values in these scalar buffers.
+    if std::env::var("VIBEVOICE_DEBUG_GENERATE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let scaling = model
+            .speech_scaling_factor()
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let bias = model
+            .speech_bias_factor()
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        eprintln!(
+            "[vv.gen scalars]  speech_scaling_factor={scaling:?}  speech_bias_factor={bias:?}"
+        );
+    }
+
     // Step 1 — compute base text embeddings out-of-band so we can splice
     // in the speaker-conditioning embedding before running the layer
     // stack. This mirrors `x = self.get_input_embeddings()(input_ids)`
@@ -206,6 +229,13 @@ pub fn generate_audio(
         // the acoustic decoder's expected range (model.py L326 inverse,
         // streaming.py L783).
         let scaled = invert_scaling(&latent, model)?;
+        if debug_loop && step_idx < 8 {
+            let scaled_stats = tensor_mean_std(&scaled)?;
+            eprintln!(
+                "[vv.gen step={step_idx}]  latent (post-scale) μ={:+.4} σ={:.4}",
+                scaled_stats.0, scaled_stats.1,
+            );
+        }
         latents.push(scaled.clone());
 
         // 3f — project back into the LM hidden space for the next step.
@@ -221,6 +251,27 @@ pub fn generate_audio(
     // Each latent is (1, 1, vae_dim) ⇒ stack → (1, T_tokens, vae_dim).
     let latents = Tensor::cat(&latents, 1)?;
     let audio = model.acoustic_tokenizer().decode(&latents)?;
+
+    // Diagnostic 2 — what's the float-domain audio range right out of
+    // the σ-VAE decoder, before any int16 quantisation? If max > 1.0 the
+    // decoder is producing values outside the [-1, 1] convention and the
+    // i16 caller is clipping. If max ≈ 1.0 with abs.mean ≈ 0.5 the
+    // decoder is already saturating.
+    if std::env::var("VIBEVOICE_DEBUG_GENERATE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let flat = audio.to_dtype(DType::F32)?.flatten_all()?;
+        let n = flat.dim(0)? as f32;
+        let amin = flat.min(0)?.to_scalar::<f32>()?;
+        let amax = flat.max(0)?.to_scalar::<f32>()?;
+        let abs_mean = flat.abs()?.sum(0)?.to_scalar::<f32>()? / n;
+        eprintln!(
+            "[vv.gen audio.float]  shape={:?}  min={amin:+.4}  max={amax:+.4}  abs.mean={abs_mean:.4}",
+            audio.dims(),
+        );
+    }
+
     Ok(GenerateOutput { audio, latents })
 }
 

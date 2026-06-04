@@ -1,7 +1,8 @@
-use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
-use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
-use objc2_metal::MTLResourceUsage;
+use crate::{get_tile_size, linear_split};
+use crate::{
+    set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Output, Source,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_cast_contiguous(
@@ -9,6 +10,7 @@ pub fn call_cast_contiguous(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     kernel_name: &'static str,
+    dtype_size: usize,
     length: usize,
     input: BufferOffset,
     output: &Buffer,
@@ -19,11 +21,11 @@ pub fn call_cast_contiguous(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (length, &input, output));
+    set_params!(encoder, (length, &input, Output::new(output)));
 
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
+    let tile_size = get_tile_size(dtype_size);
+    let tiles = length.div_ceil(tile_size);
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -49,13 +51,18 @@ pub fn call_cast_strided(
 
     set_params!(
         encoder,
-        (length, shape.len(), shape, input_strides, &input, output)
+        (
+            length,
+            shape.len(),
+            shape,
+            input_strides,
+            &input,
+            Output::new(output)
+        )
     );
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
 
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }

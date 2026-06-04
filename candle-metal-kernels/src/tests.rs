@@ -1,10 +1,17 @@
 use super::*;
-use crate::metal::create_command_buffer;
+use crate::metal::{Commands, ResidencySet};
 use core::ffi::c_void;
 use half::{bf16, f16};
 use rand::prelude::SliceRandom;
-use rand::thread_rng;
-use rand::Rng;
+use rand::{rng, Rng};
+use std::sync::Arc;
+use std::thread;
+
+fn commands(device: &Device) -> Commands {
+    let queue = device.new_command_queue().unwrap();
+    let residency_set = Arc::new(ResidencySet::new(&device));
+    Commands::new(queue, &residency_set).unwrap()
+}
 
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     let ptr = buffer.contents() as *const T;
@@ -14,7 +21,7 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
 }
 
 fn new_buffer<T>(device: &Device, data: &[T]) -> Buffer {
-    let options = MTLResourceOptions::StorageModeManaged;
+    let options = RESOURCE_OPTIONS;
     let ptr = data.as_ptr() as *const c_void;
     let size = std::mem::size_of_val(data);
     device.new_buffer_with_data(ptr, size, options).unwrap()
@@ -42,8 +49,8 @@ fn approx_bf16(v: Vec<bf16>, digits: i32) -> Vec<f32> {
 fn run<T: Clone>(v: &[T], name: unary::contiguous::Kernel) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let input = new_buffer(&device, v);
     let input = BufferOffset {
         buffer: &input,
@@ -52,25 +59,26 @@ fn run<T: Clone>(v: &[T], name: unary::contiguous::Kernel) -> Vec<T> {
     let output = new_buffer(&device, v);
     call_unary_contiguous(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
+        size_of::<T>(),
         v.len(),
         input,
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
     read_to_vec(&output, v.len())
 }
 
-fn run_binary<T: Clone>(x: &[T], y: &[T], name: kernels::binary::contiguous::Kernel) -> Vec<T> {
+fn run_binary<T: Clone, S: ToString>(x: &[T], y: &[T], name: S) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
-    let options = MTLResourceOptions::StorageModeManaged;
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
     let left = new_buffer(&device, x);
     let right = new_buffer(&device, y);
     let output = device
@@ -78,17 +86,18 @@ fn run_binary<T: Clone>(x: &[T], y: &[T], name: kernels::binary::contiguous::Ker
         .unwrap();
     call_binary_contiguous(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
+        size_of::<T>(),
         x.len(),
         BufferOffset::zero_offset(&left),
         BufferOffset::zero_offset(&right),
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
     read_to_vec(&output, x.len())
 }
 
@@ -100,8 +109,8 @@ fn run_strided<T: Clone>(
     offset: usize,
 ) -> Vec<T> {
     let device = device();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let input = new_buffer(&device, v);
     let input = BufferOffset {
         buffer: &input,
@@ -114,18 +123,11 @@ fn run_strided<T: Clone>(
     };
     let kernels = Kernels::new();
     call_unary_strided(
-        &device,
-        &command_buffer,
-        &kernels,
-        kernel,
-        shape,
-        input,
-        strides,
-        output,
+        &device, &encoder, &kernels, kernel, shape, input, strides, output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
     read_to_vec(&output_b, v.len())
 }
 
@@ -234,9 +236,9 @@ fn gelu_f16() {
         .iter()
         .map(|v| f16::from_f32(*v))
         .collect();
-    let expected: Vec<f32> = vec![-0.0, -0.16, 0.0, 0.84, 1.96, 3.0, 10.0, 20.0];
+    let expected: Vec<f32> = vec![-0.0, -0.159, 0.0, 0.841, 1.954, 2.996, 10.0, 20.0];
     let results = run(&v, unary::contiguous::gelu::HALF);
-    assert_eq!(approx_f16(results, 2), expected);
+    assert_eq!(approx_f16(results, 3), expected);
 }
 
 #[test]
@@ -270,7 +272,7 @@ fn silu_f32() {
 fn binary_add_f32() {
     let left = vec![1.0f32, 2.0, 3.0];
     let right = vec![2.0f32, 3.1, 4.2];
-    let results = run_binary(&left, &right, kernels::binary::contiguous::add::FLOAT);
+    let results = run_binary(&left, &right, "badd_f32");
     let expected: Vec<_> = left
         .iter()
         .zip(right.iter())
@@ -289,47 +291,51 @@ fn binary_ops_bf16() {
         .collect();
 
     macro_rules! binary_op {
-        ($opname:ident, $opexpr:expr) => {{
-            let results = run_binary(&lhs, &rhs, kernels::binary::contiguous::$opname::BFLOAT);
+        ($opname:ident, $dtype:ident, $opexpr:expr) => {{
+            let results = run_binary(
+                &lhs,
+                &rhs,
+                concat!(stringify!($opname), "_", stringify!($dtype)),
+            );
             let expected: Vec<bf16> = lhs
                 .iter()
                 .zip(rhs.iter())
-                .map(|(x, y): (&bf16, &bf16)| $opexpr(*x, *y))
+                .map(|(x, y): (&$dtype, &$dtype)| $opexpr(*x, *y))
                 .collect();
             assert_eq!(results, expected);
         }};
     }
-
-    binary_op!(add, |x, y| x + y);
-    binary_op!(sub, |x, y| x - y);
-    binary_op!(mul, |x, y| x * y);
-    binary_op!(div, |x, y| x / y);
-    binary_op!(min, |x: bf16, y| x.min(y));
-    binary_op!(max, |x: bf16, y| x.max(y));
+    binary_op!(badd, bf16, |x, y| x + y);
+    binary_op!(bsub, bf16, |x, y| x - y);
+    binary_op!(bmul, bf16, |x, y| x * y);
+    binary_op!(bdiv, bf16, |x, y| x / y);
+    binary_op!(bminimum, bf16, |x: bf16, y| x.min(y));
+    binary_op!(bmaximum, bf16, |x: bf16, y| x.max(y));
 }
 
 fn run_cast<T: Clone, U: Clone>(v: &[T], name: &'static str) -> Vec<U> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let input = new_buffer(&device, v);
-    let options = MTLResourceOptions::StorageModeManaged;
+    let options = RESOURCE_OPTIONS;
     let size = v.len() * std::mem::size_of::<U>();
     let output = device.new_buffer(size, options).unwrap();
 
     call_cast_contiguous(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
+        size_of::<T>(),
         v.len(),
         BufferOffset::zero_offset(&input),
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
     read_to_vec(&output, v.len())
 }
 
@@ -522,8 +528,8 @@ fn cast_i64() {
 fn run_affine<T: Clone>(v: &[T], mul: f64, add: f64) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
 
     let input = new_buffer(&device, v);
     let output = new_buffer(&device, v);
@@ -532,9 +538,10 @@ fn run_affine<T: Clone>(v: &[T], mul: f64, add: f64) -> Vec<T> {
 
     call_affine(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         "affine_f32",
+        size_of::<T>(),
         size,
         BufferOffset::zero_offset(&input),
         &output,
@@ -542,8 +549,8 @@ fn run_affine<T: Clone>(v: &[T], mul: f64, add: f64) -> Vec<T> {
         add as f32,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&output, v.len())
 }
@@ -557,15 +564,15 @@ fn run_affine_strided<T: Clone>(
 ) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
 
     let input = new_buffer(&device, v);
     let output = new_buffer(&device, v);
 
     call_affine_strided(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         "affine_f32_strided",
         shape,
@@ -576,8 +583,8 @@ fn run_affine_strided<T: Clone>(
         add as f32,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     let len: usize = shape.iter().product();
     read_to_vec(&output, len)
@@ -614,8 +621,8 @@ fn run_mlx_sort<T: Clone>(v: &[T], ncols: usize) -> Vec<u32> {
     let nrows = v.len() / ncols;
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
 
     let input = new_buffer(&device, v);
     let indexes = vec![0u32; v.len()];
@@ -623,7 +630,7 @@ fn run_mlx_sort<T: Clone>(v: &[T], ncols: usize) -> Vec<u32> {
 
     call_mlx_arg_sort(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         DType::F32,
         nrows,
@@ -632,8 +639,8 @@ fn run_mlx_sort<T: Clone>(v: &[T], ncols: usize) -> Vec<u32> {
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
     read_to_vec(&output, v.len())
 }
 
@@ -752,6 +759,39 @@ fn index_select_is_u8_bf16() {
 }
 
 #[test]
+fn index_select_is_u32_i64() {
+    let embedding: Vec<i64> = (1..=10).map(|x| x as i64).collect();
+    let shape = [5, 2];
+    let stride = [2, 1];
+    let ids = [0u32, 4, 2];
+    let dim = 0;
+    let result = run_index_select(&embedding, &shape, &stride, &ids, dim, "is_u32_i64");
+    assert_eq!(result, vec![1i64, 2, 9, 10, 5, 6]);
+}
+
+#[test]
+fn index_select_is_u8_i64() {
+    let embedding: Vec<i64> = (1..=10).map(|x| x as i64).collect();
+    let shape = [5, 2];
+    let stride = [2, 1];
+    let ids = [0u8, 4, 2];
+    let dim = 0;
+    let result = run_index_select(&embedding, &shape, &stride, &ids, dim, "is_u8_i64");
+    assert_eq!(result, vec![1i64, 2, 9, 10, 5, 6]);
+}
+
+#[test]
+fn index_select_is_i64_i64() {
+    let embedding: Vec<i64> = (1..=10).map(|x| x as i64).collect();
+    let shape = [5, 2];
+    let stride = [2, 1];
+    let ids = [0i64, 4, 2];
+    let dim = 0;
+    let result = run_index_select(&embedding, &shape, &stride, &ids, dim, "is_i64_i64");
+    assert_eq!(result, vec![1i64, 2, 9, 10, 5, 6]);
+}
+
+#[test]
 fn index_select_dim1() {
     let embedding = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
     let shape = [5, 2];
@@ -775,8 +815,8 @@ fn run_index_select<T: Clone, I: Clone + std::fmt::Debug>(
 ) -> Vec<T> {
     let device = Device::system_default().expect("no device found");
 
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let embeddings_buffer = new_buffer(&device, embeddings);
     let ids_buffer = new_buffer(&device, ids);
 
@@ -788,7 +828,7 @@ fn run_index_select<T: Clone, I: Clone + std::fmt::Debug>(
     let kernels = Kernels::new();
     call_index_select(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
         shape,
@@ -803,8 +843,8 @@ fn run_index_select<T: Clone, I: Clone + std::fmt::Debug>(
     )
     .unwrap();
 
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&dst_buffer, dst_el)
 }
@@ -819,8 +859,8 @@ fn run_index_select_strided<T: Clone, I: Clone + std::fmt::Debug>(
 ) -> Vec<T> {
     let device = Device::system_default().expect("no device found");
 
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let embeddings_buffer = new_buffer(&device, embeddings);
     let ids_buffer = new_buffer(&device, ids);
 
@@ -832,7 +872,7 @@ fn run_index_select_strided<T: Clone, I: Clone + std::fmt::Debug>(
     let kernels = Kernels::new();
     call_index_select(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
         shape,
@@ -847,8 +887,8 @@ fn run_index_select_strided<T: Clone, I: Clone + std::fmt::Debug>(
     )
     .unwrap();
 
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&dst_buffer, dst_el)
 }
@@ -873,18 +913,18 @@ fn run_reduce<T, U: Clone>(
 ) -> Vec<U> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let input = new_buffer(&device, v);
 
-    let options = MTLResourceOptions::StorageModeManaged;
+    let options = RESOURCE_OPTIONS;
     let output = device
         .new_buffer(out_length * core::mem::size_of::<U>(), options)
         .unwrap();
     let shape = vec![in_length];
     match call_reduce_contiguous(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
         &shape,
@@ -898,8 +938,8 @@ fn run_reduce<T, U: Clone>(
             panic!();
         }
     }
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&output, out_length)
 }
@@ -907,13 +947,13 @@ fn run_reduce<T, U: Clone>(
 fn run_softmax<T: Clone + std::fmt::Debug>(v: &[T], last_dim: usize, name: &'static str) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let input = new_buffer(&device, v);
     let output = new_buffer(&device, v);
     call_last_softmax(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
         v.len(),
@@ -923,8 +963,8 @@ fn run_softmax<T: Clone + std::fmt::Debug>(v: &[T], last_dim: usize, name: &'sta
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&output, v.len())
 }
@@ -999,7 +1039,7 @@ fn reduce_sum_case<const N: usize, const D: usize>() {
     let mut v = create_array::<N>();
     if D == 1 {
         // Hardens 1-dimensional test cases
-        v.shuffle(&mut thread_rng());
+        v.shuffle(&mut rng());
     }
     let results = run_reduce(&v, N, D, "fast_sum_f32");
     assert_eq!(approx(results, 4), correct_sum::<N, D>());
@@ -1009,7 +1049,7 @@ fn reduce_max_case<const N: usize, const D: usize>() {
     let mut v = create_array::<N>();
     if D == 1 {
         // Hardens 1-dimensional test cases
-        v.shuffle(&mut thread_rng());
+        v.shuffle(&mut rng());
     }
     let results = run_reduce(&v, N, D, "fast_max_f32");
     assert_eq!(approx(results, 4), correct_max::<N, D>());
@@ -1019,7 +1059,7 @@ fn reduce_argmax_case<const N: usize, const D: usize>() {
     let mut v = create_array::<N>();
     if D == 1 {
         // Hardens 1-dimensional test cases
-        v.shuffle(&mut thread_rng());
+        v.shuffle(&mut rng());
     }
     let results: Vec<u32> = run_reduce(&v, N, D, "fast_argmax_f32");
     assert_eq!(results, correct_argmax::<N, D>(v));
@@ -1191,9 +1231,9 @@ fn run_where_cond<I: Clone, T: Clone>(
 ) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
-    let options = MTLResourceOptions::StorageModeManaged;
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
 
     let length = cond.len();
     let cond = device
@@ -1233,23 +1273,27 @@ fn run_where_cond<I: Clone, T: Clone>(
         buffer: &right,
         offset_in_bytes: cond_offset,
     };
-    call_where_cond_strided(
+    call_where_cond(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
+        size_of::<T>(),
         shape,
         cond,
         &cond_stride,
+        true,
         left,
         &left_stride,
+        true,
         right,
         &cond_stride,
+        true,
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&output, length)
 }
@@ -1310,9 +1354,9 @@ fn run_mlx_gemm<T: Clone>(
 ) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
-    let options = MTLResourceOptions::StorageModeManaged;
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
 
     let lhs = device
         .new_buffer_with_data(
@@ -1334,7 +1378,7 @@ fn run_mlx_gemm<T: Clone>(
         .unwrap();
     call_mlx_gemm(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         dtype,
         (b, m, n, k),
@@ -1347,8 +1391,8 @@ fn run_mlx_gemm<T: Clone>(
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&output, length)
 }
@@ -1460,10 +1504,10 @@ fn mlx_gemm() {
 fn run_random<T: Clone>(name: &'static str, seed: u64, length: usize, a: f32, b: f32) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
 
-    let options = MTLResourceOptions::StorageModeManaged;
+    let options = RESOURCE_OPTIONS;
     let output = device
         .new_buffer(length * core::mem::size_of::<T>(), options)
         .unwrap();
@@ -1478,33 +1522,17 @@ fn run_random<T: Clone>(name: &'static str, seed: u64, length: usize, a: f32, b:
 
     if name.starts_with("rand_uniform") {
         call_random_uniform(
-            &device,
-            &command_buffer,
-            &kernels,
-            name,
-            a,
-            b,
-            length,
-            &seed,
-            &output,
+            &device, &encoder, &kernels, name, a, b, length, &seed, &output,
         )
         .unwrap();
     } else {
         call_random_normal(
-            &device,
-            &command_buffer,
-            &kernels,
-            name,
-            a,
-            b,
-            length,
-            &seed,
-            &output,
+            &device, &encoder, &kernels, name, a, b, length, &seed, &output,
         )
         .unwrap();
     }
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&output, length)
 }
@@ -1591,9 +1619,9 @@ fn run_scatter_add<T: Clone, I: Clone + std::fmt::Debug>(
 ) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
-    let options = MTLResourceOptions::StorageModeManaged;
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
     let input_buffer = new_buffer(&device, input);
     let ids_buffer = new_buffer(&device, ids);
     let output = device
@@ -1601,7 +1629,7 @@ fn run_scatter_add<T: Clone, I: Clone + std::fmt::Debug>(
         .unwrap();
     call_scatter(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
         shape,
@@ -1612,8 +1640,8 @@ fn run_scatter_add<T: Clone, I: Clone + std::fmt::Debug>(
         BufferOffset::zero_offset(&output),
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
     read_to_vec(&output, input.len())
 }
 
@@ -1696,14 +1724,14 @@ fn run_index_add<T: Clone, I: Clone + std::fmt::Debug>(
 ) -> Vec<T> {
     let device = device();
     let kernels = Kernels::new();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let input_buffer = new_buffer(&device, right);
     let output = new_buffer(&device, left);
     let indices_buffer = new_buffer(&device, indices);
     call_index_add(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
         shape,
@@ -1715,8 +1743,8 @@ fn run_index_add<T: Clone, I: Clone + std::fmt::Debug>(
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
     read_to_vec(&output, left.len())
 }
 
@@ -1809,8 +1837,8 @@ fn run_pool2d<T: Clone>(
     name: &'static str,
 ) -> Vec<T> {
     let device = device();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
     let out_w = (shape[2] - w_k) / w_stride + 1;
     let out_h = (shape[3] - h_k) / h_stride + 1;
     let dst_el = out_w * out_h * shape[0] * shape[1];
@@ -1818,24 +1846,12 @@ fn run_pool2d<T: Clone>(
     let output = new_buffer(&device, &vec![0.0f32; dst_el]);
     let kernels = Kernels::new();
     call_pool2d(
-        &device,
-        &command_buffer,
-        &kernels,
-        name,
-        shape,
-        strides,
-        out_w,
-        out_h,
-        w_k,
-        h_k,
-        w_stride,
-        h_stride,
-        &input,
-        &output,
+        &device, &encoder, &kernels, name, shape, strides, out_w, out_h, w_k, h_k, w_stride,
+        h_stride, &input, &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&output, dst_el)
 }
@@ -2164,8 +2180,8 @@ fn run_conv_transpose1d<T: Clone>(
     name: &'static str,
 ) -> Vec<T> {
     let device = device();
-    let command_queue = device.new_command_queue().unwrap();
-    let command_buffer = create_command_buffer(&command_queue).unwrap();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
 
     let c_out = kernel_shape[1];
     let k_size = kernel_shape[2];
@@ -2181,7 +2197,7 @@ fn run_conv_transpose1d<T: Clone>(
 
     call_conv_transpose1d(
         &device,
-        &command_buffer,
+        &encoder,
         &kernels,
         name,
         dilation,
@@ -2202,8 +2218,8 @@ fn run_conv_transpose1d<T: Clone>(
         &output,
     )
     .unwrap();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
 
     read_to_vec(&output, dst_el)
 }
@@ -2371,25 +2387,22 @@ fn const_fill() {
     fn constant_fill<T: Clone + EncoderParam>(name: &'static str, len: usize, value: T) -> Vec<T> {
         let dev = device();
         let kernels = Kernels::new();
-        let command_queue = dev.new_command_queue().unwrap();
-        let command_buffer = create_command_buffer(&command_queue).unwrap();
+        let commands = commands(&dev);
+        let encoder = commands.command_encoder().unwrap();
         let buffer = dev
-            .new_buffer(
-                len * std::mem::size_of::<T>(),
-                MTLResourceOptions::StorageModePrivate,
-            )
+            .new_buffer(len * std::mem::size_of::<T>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_const_fill(&dev, &command_buffer, &kernels, name, len, &buffer, value).unwrap();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
+        call_const_fill(&dev, &encoder, &kernels, name, len, &buffer, value).unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
         read_to_vec::<T>(&buffer, len)
     }
     fn test<T: Clone + Copy + EncoderParam + PartialEq + std::fmt::Debug, F: FnOnce(f32) -> T>(
         name: &'static str,
         f: F,
     ) {
-        let len = rand::thread_rng().gen_range(2..16) * rand::thread_rng().gen_range(4..16);
-        let value = rand::thread_rng().gen_range(1. ..19.);
+        let len = rand::rng().random_range(2..16) * rand::rng().random_range(4..16);
+        let value = rand::rng().random_range(1. ..19.);
         let value = f(value);
         let v = constant_fill::<T>(name, len, value);
         assert_eq!(v, vec![value; len])
@@ -2400,4 +2413,41 @@ fn const_fill() {
     test::<f16, _>("fill_f16", f16::from_f32);
     test::<bf16, _>("fill_bf16", bf16::from_f32);
     test::<f32, _>("fill_f32", |v| v);
+}
+
+#[test]
+fn commands_creation_and_encoder() {
+    let device = Device::system_default().unwrap();
+    let queue = device.new_command_queue().unwrap();
+    let residency_set = Arc::new(ResidencySet::new(&device));
+    let commands = Commands::new(queue, &residency_set).unwrap();
+
+    let encoder = commands.command_encoder().unwrap();
+    drop(encoder);
+}
+
+#[test]
+fn commands_concurrent_acquisition() {
+    std::env::set_var("CANDLE_METAL_COMPUTE_PER_BUFFER", "2");
+
+    let device = Device::system_default().unwrap();
+    let queue = device.new_command_queue().unwrap();
+    let residency_set = Arc::new(ResidencySet::new(&device));
+    let commands = Arc::new(Commands::new(queue, &residency_set).unwrap());
+
+    let mut handles = vec![];
+
+    for _ in 0..16 {
+        let c = Arc::clone(&commands);
+        handles.push(thread::spawn(move || {
+            let encoder = c.command_encoder().unwrap();
+            drop(encoder);
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    commands.wait_until_completed().unwrap();
 }

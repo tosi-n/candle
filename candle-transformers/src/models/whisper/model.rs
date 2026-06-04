@@ -104,6 +104,20 @@ impl MultiHeadAttention {
         v: &Tensor,
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let (wv, _) = self.qkv_attention_with_weights(q, k, v, mask)?;
+        Ok(wv)
+    }
+
+    /// Run attention and additionally return the post-softmax attention
+    /// weights `w` of shape `(batch, n_head, n_q_ctx, n_kv_ctx)`. Used by
+    /// downstream alignment passes (e.g. DTW for word-level timestamps).
+    fn qkv_attention_with_weights(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
         let (_, n_ctx, n_state) = q.dims3()?;
         let scale = ((n_state / self.n_head) as f64).powf(-0.25);
         let q = (self.reshape_head(q)? * scale)?;
@@ -127,7 +141,44 @@ impl MultiHeadAttention {
         }
         .transpose(1, 2)?
         .flatten_from(2)?;
-        Ok(wv)
+        Ok((wv, w))
+    }
+
+    /// Variant of [`forward`](Self::forward) that also returns the per-head
+    /// attention weights for the call. Mirrors the regular forward exactly,
+    /// only the output tuple differs.
+    fn forward_with_weights(
+        &mut self,
+        x: &Tensor,
+        xa: Option<&Tensor>,
+        mask: Option<&Tensor>,
+        flush_cache: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let _enter = self.span.enter();
+        let q = self.query.forward(x)?;
+        let (k, v) = match xa {
+            None => {
+                let k = self.key.forward(x)?;
+                let v = self.value.forward(x)?;
+                (k, v)
+            }
+            Some(x) => {
+                if flush_cache {
+                    self.kv_cache = None;
+                }
+                if let Some((k, v)) = &self.kv_cache {
+                    (k.clone(), v.clone())
+                } else {
+                    let k = self.key.forward(x)?;
+                    let v = self.value.forward(x)?;
+                    self.kv_cache = Some((k.clone(), v.clone()));
+                    (k, v)
+                }
+            }
+        };
+        let (wv, weights) = self.qkv_attention_with_weights(&q, &k, &v, mask)?;
+        let out = self.out.forward(&wv)?;
+        Ok((out, weights))
     }
 
     fn reset_kv_cache(&mut self) {
@@ -196,6 +247,40 @@ impl ResidualAttentionBlock {
                 .gelu()?,
         )?;
         x + mlp
+    }
+
+    /// Variant of [`forward`](Self::forward) that additionally returns the
+    /// cross-attention weights when `xa` is provided and this block has a
+    /// cross-attention layer. Returns `None` for blocks without cross-attn
+    /// (the audio encoder side) so call sites can re-use this method
+    /// uniformly across encoder and decoder stacks if needed.
+    fn forward_with_cross_attention(
+        &mut self,
+        x: &Tensor,
+        xa: Option<&Tensor>,
+        mask: Option<&Tensor>,
+        flush_kv_cache: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let _enter = self.span.enter();
+        let attn = self
+            .attn
+            .forward(&self.attn_ln.forward(x)?, None, mask, flush_kv_cache)?;
+        let mut x = (x + attn)?;
+        let cross_weights = if let Some((attn, ln)) = &mut self.cross_attn {
+            let (delta, weights) =
+                attn.forward_with_weights(&ln.forward(&x)?, xa, None, flush_kv_cache)?;
+            x = (&x + delta)?;
+            Some(weights)
+        } else {
+            None
+        };
+        let mlp = self.mlp_linear2.forward(
+            &self
+                .mlp_linear1
+                .forward(&self.mlp_ln.forward(&x)?)?
+                .gelu()?,
+        )?;
+        Ok(((x + mlp)?, cross_weights))
     }
 
     fn reset_kv_cache(&mut self) {
@@ -352,6 +437,36 @@ impl TextDecoder {
             x = block.forward(&x, Some(xa), Some(&self.mask), flush_kv_cache)?;
         }
         self.ln.forward(&x)
+    }
+
+    /// Like [`forward`](Self::forward) but also returns per-layer cross-
+    /// attention weights — one tensor per decoder block, each shaped
+    /// `(batch, n_head, n_text_ctx, n_audio_ctx)`. The weights are taken
+    /// directly from each block's encoder-attention softmax; downstream
+    /// alignment code is responsible for selecting alignment heads, applying
+    /// median filtering, and running DTW.
+    pub fn forward_with_cross_attention(
+        &mut self,
+        x: &Tensor,
+        xa: &Tensor,
+        flush_kv_cache: bool,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let _enter = self.span.enter();
+        let last = x.dim(D::Minus1)?;
+        let token_embedding = self.token_embedding.forward(x)?;
+        let positional_embedding = self.positional_embedding.narrow(0, 0, last)?;
+        let mut x = token_embedding.broadcast_add(&positional_embedding)?;
+        let mut cross_weights = Vec::with_capacity(self.blocks.len());
+        for block in self.blocks.iter_mut() {
+            let (next, weights) =
+                block.forward_with_cross_attention(&x, Some(xa), Some(&self.mask), flush_kv_cache)?;
+            x = next;
+            if let Some(weights) = weights {
+                cross_weights.push(weights);
+            }
+        }
+        let hidden = self.ln.forward(&x)?;
+        Ok((hidden, cross_weights))
     }
 
     pub fn final_linear(&self, x: &Tensor) -> Result<Tensor> {

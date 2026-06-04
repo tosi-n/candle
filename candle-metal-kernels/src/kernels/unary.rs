@@ -1,11 +1,11 @@
 use crate::kernels::macros::ops;
 use crate::utils::{BufferOffset, EncoderProvider};
-use crate::{get_block_dims, linear_split};
+use crate::{get_block_dims, get_tile_size, linear_split};
 use crate::{
     set_params, Buffer, ComputeCommandEncoder, Device, EncoderParam, Kernels, MetalKernelError,
-    Source,
+    Output, Source,
 };
-use objc2_metal::{MTLResourceUsage, MTLSize};
+use objc2_metal::MTLSize;
 
 ops!(
     cos, sin, exp, sqr, sqrt, neg, log, gelu, abs, ceil, floor, relu, round, erf, gelu_erf, tanh,
@@ -18,6 +18,7 @@ pub fn call_unary_contiguous(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     kernel_name: contiguous::Kernel,
+    dtype_size: usize,
     length: usize,
     input: BufferOffset,
     output: &Buffer,
@@ -28,38 +29,11 @@ pub fn call_unary_contiguous(
 
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (length, &input, output));
+    set_params!(encoder, (length, &input, Output::new(output)));
 
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
-    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn call_unary_contiguous_tiled(
-    device: &Device,
-    ep: impl EncoderProvider,
-    kernels: &Kernels,
-    kernel_name: contiguous_tiled::Kernel,
-    length: usize,
-    input: BufferOffset,
-    output: &Buffer,
-) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Unary, kernel_name.0)?;
-    let encoder = ep.encoder();
-    let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    let tile_size = 2;
+    let tile_size = get_tile_size(dtype_size);
     let tiles = length.div_ceil(tile_size);
-
-    encoder.set_compute_pipeline_state(&pipeline);
-
-    set_params!(encoder, (length, &input, output));
-
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -84,35 +58,17 @@ pub fn call_unary_strided(
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
 
     encoder.set_compute_pipeline_state(&pipeline);
-    set_params!(encoder, (length, num_dims, shape, strides, &input, &output));
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output.buffer, MTLResourceUsage::Write);
-    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn call_const_set_contiguous_tiled(
-    device: &Device,
-    ep: impl EncoderProvider,
-    kernels: &Kernels,
-    kernel_name: contiguous_tiled::Kernel,
-    length: usize,
-    input: impl EncoderParam,
-    output: BufferOffset,
-) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Unary, kernel_name.0)?;
-    let encoder = ep.encoder();
-    let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    let tile_size = 2;
-    let tiles = length.div_ceil(tile_size);
-
-    encoder.set_compute_pipeline_state(&pipeline);
-
-    set_params!(encoder, (length, input, &output));
-
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
-    encoder.use_resource(output.buffer, MTLResourceUsage::Write);
+    set_params!(
+        encoder,
+        (
+            length,
+            num_dims,
+            shape,
+            strides,
+            &input,
+            Output::from_buffer_offset(&output)
+        )
+    );
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -123,6 +79,7 @@ pub fn call_const_set_contiguous(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     kernel_name: contiguous::Kernel,
+    dtype_size: usize,
     length: usize,
     input: impl EncoderParam,
     output: BufferOffset,
@@ -132,11 +89,14 @@ pub fn call_const_set_contiguous(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
 
     encoder.set_compute_pipeline_state(&pipeline);
+    set_params!(
+        encoder,
+        (length, input, Output::from_buffer_offset(&output))
+    );
 
-    set_params!(encoder, (length, input, &output));
-
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
-    encoder.use_resource(output.buffer, MTLResourceUsage::Write);
+    let tile_size = get_tile_size(dtype_size);
+    let tiles = length.div_ceil(tile_size);
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -161,8 +121,17 @@ pub fn call_const_set_strided(
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
 
     encoder.set_compute_pipeline_state(&pipeline);
-    set_params!(encoder, (length, num_dims, shape, strides, input, &output));
-    encoder.use_resource(output.buffer, MTLResourceUsage::Write);
+    set_params!(
+        encoder,
+        (
+            length,
+            num_dims,
+            shape,
+            strides,
+            input,
+            Output::from_buffer_offset(&output)
+        )
+    );
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -173,6 +142,8 @@ pub mod copy2d {
     pub const HALF: Kernel = Kernel("copy2d_f16");
     pub const BFLOAT: Kernel = Kernel("copy2d_bf16");
     pub const I64: Kernel = Kernel("copy2d_i64");
+    pub const I32: Kernel = Kernel("copy2d_i32");
+    pub const I16: Kernel = Kernel("copy2d_i16");
     pub const U32: Kernel = Kernel("copy2d_u32");
     pub const U8: Kernel = Kernel("copy2d_u8");
 }
@@ -204,7 +175,7 @@ pub fn call_copy2d(
             src_s as i64,
             dst_s as i64,
             (input, src_o_in_bytes),
-            (output, dst_o_in_bytes)
+            Output::with_offset(output, dst_o_in_bytes)
         )
     );
 
@@ -214,8 +185,6 @@ pub fn call_copy2d(
         depth: 1,
     };
     let group_dims = get_block_dims(d1, d2, 1);
-    encoder.use_resource(input, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_threads(grid_dims, group_dims);
     Ok(())
 }

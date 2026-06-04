@@ -9,37 +9,40 @@
 use super::with_tracing::QMatMul;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::{gguf_file, QTensor};
-use candle::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
+use candle::{DType, Device, Result, Storage, Tensor};
+use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
+use candle_nn::attention::{flash_attn, AttnMask};
+use candle_nn::kv_cache::{ConcatKvCache, InterleavedKvCache, RawInterleavedKvCache};
+use candle_nn::{Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-struct Gguf<R: Read + Seek> {
+pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
     device: Device,
 }
 
 impl<R: Read + Seek> Gguf<R> {
-    fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
+    pub fn new(ct: gguf_file::Content, reader: R, device: Device) -> Self {
         Self { ct, reader, device }
     }
 
-    fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
+    pub fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         QMatMul::from_weights(ws.into())
     }
 
-    fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
+    pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         RmsNorm::from_qtensor(ws, eps)
     }
 
-    fn metadata(&self) -> &std::collections::HashMap<String, gguf_file::Value> {
+    pub fn metadata(&self) -> &std::collections::HashMap<String, gguf_file::Value> {
         &self.ct.metadata
     }
 
-    fn tensor(&mut self, name: &str) -> Result<QTensor> {
+    pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
 }
@@ -81,13 +84,17 @@ impl Module for MlpWeights {
 }
 
 #[derive(Debug, Clone)]
-struct RotaryEmbedding {
+pub struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    /// Pre-extracted flat f32 cos/sin for fused decode (zero allocation)
+    cos_f32: Vec<f32>,
+    sin_f32: Vec<f32>,
+    half_d: usize,
 }
 
 impl RotaryEmbedding {
-    fn new(
+    pub fn new(
         dtype: DType,
         head_dim: usize,
         max_position_embeddings: usize,
@@ -106,20 +113,41 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
+        let sin_t = freqs.sin()?;
+        let cos_t = freqs.cos()?;
+        let cos_f32 = cos_t
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let sin_f32 = sin_t
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            sin: sin_t,
+            cos: cos_t,
+            cos_f32,
+            sin_f32,
+            half_d: dim / 2,
         })
     }
 
     /// Apply RoPE (q, k shape: B x H x L x D)
-    fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
+    pub fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, _) = q.dims4()?;
         let cos = self.cos.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
         let sin = self.sin.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?;
         let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
+    }
+
+    /// Zero-allocation cos/sin slices for a single position.
+    #[inline]
+    pub fn cos_sin_at(&self, pos: usize) -> (&[f32], &[f32]) {
+        let start = pos * self.half_d;
+        let end = start + self.half_d;
+        (&self.cos_f32[start..end], &self.sin_f32[start..end])
     }
 }
 
@@ -135,12 +163,16 @@ struct AttentionWeights {
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
+    hidden_size: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: KvCache,
+    kv_cache: Option<ConcatKvCache>,
+    interleaved_cache: Option<InterleavedKvCache>,
+    raw_cache: Option<RawInterleavedKvCache>,
     span_attn: tracing::Span,
 }
 
 impl AttentionWeights {
+    #[allow(clippy::too_many_arguments)]
     fn new<R: Read + Seek>(
         gg: &mut Gguf<R>,
         num_heads: usize,
@@ -148,9 +180,11 @@ impl AttentionWeights {
         head_dim: usize,
         rms_norm_eps: f64,
         rotary_emb: Arc<RotaryEmbedding>,
+        device: &Device,
         prefix: &str,
     ) -> Result<Self> {
         let num_kv_groups = num_heads / num_kv_heads;
+        let hidden_size = num_heads * head_dim;
 
         let q_proj = gg.qmatmul(&format!("{prefix}.attn_q.weight"))?;
         let k_proj = gg.qmatmul(&format!("{prefix}.attn_k.weight"))?;
@@ -160,9 +194,24 @@ impl AttentionWeights {
         let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
         let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
 
-        // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
-        // The cache will grow in chunks of 512 tokens when needed.
-        let kv_cache = KvCache::new(2, 512);
+        // CPU: use interleaved + raw caches for flash attention
+        // GPU: use standard concat KV cache (fallback path)
+        let on_cpu = device.is_cpu();
+        let kv_cache = if on_cpu {
+            None
+        } else {
+            Some(ConcatKvCache::new(2))
+        };
+        let interleaved_cache = if on_cpu {
+            Some(InterleavedKvCache::new(head_dim))
+        } else {
+            None
+        };
+        let raw_cache = if on_cpu {
+            Some(RawInterleavedKvCache::new(num_kv_heads, head_dim, 4096))
+        } else {
+            None
+        };
 
         let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
 
@@ -177,8 +226,11 @@ impl AttentionWeights {
             num_kv_heads,
             num_kv_groups,
             head_dim,
+            hidden_size,
             rotary_emb,
             kv_cache,
+            interleaved_cache,
+            raw_cache,
             span_attn,
         })
     }
@@ -187,6 +239,7 @@ impl AttentionWeights {
         let _enter = self.span_attn.enter();
         let (b, l, _) = x.dims3()?;
 
+        // QKV projections
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
@@ -201,47 +254,140 @@ impl AttentionWeights {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
+        // Per-head Q/K norms (must stay as tensor ops)
         let q_flat = q.flatten(0, 2)?;
         let k_flat = k.flatten(0, 2)?;
-
         let q_flat = self.q_norm.forward(&q_flat)?;
         let k_flat = self.k_norm.forward(&k_flat)?;
         let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
         let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
 
+        // RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
 
-        // Reset KV cache if we're at the first position
-        if offset == 0 {
-            self.kv_cache.reset();
-        }
-        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        // TODO: b > 1 needs varlen CPU flash with interleaved cache support.
+        if x.device().is_cpu() && b == 1 {
+            let scale = 1.0 / (self.head_dim as f32).sqrt();
 
-        // Make tensor contiguous to avoid some strided copies
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
+            if l == 1 && b == 1 && q.dtype() == DType::F32 {
+                // Fused decode: raw slices -> raw cache -> kernel.
+                let q_cont = q.squeeze(0)?.squeeze(1)?.contiguous()?;
+                let (q_g, q_l) = q_cont.storage_and_layout();
+                let q_data: &[f32] = match &*q_g {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[q_l.start_offset()..],
+                    _ => candle::bail!("Expected CPU storage"),
+                };
 
-        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+                let k_cont = k.squeeze(0)?.squeeze(1)?.contiguous()?;
+                let (k_g, k_l) = k_cont.storage_and_layout();
+                let k_data: &[f32] = match &*k_g {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[k_l.start_offset()..],
+                    _ => candle::bail!("Expected CPU storage"),
+                };
 
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        if let Some(m) = attn_mask {
-            let m_dtype = m.dtype();
-            let scores_dtype = scores.dtype();
-            let mask = if m_dtype != scores_dtype {
-                m.to_dtype(scores_dtype)?
+                let v_cont = v.squeeze(0)?.squeeze(1)?.contiguous()?;
+                let (v_g, v_l) = v_cont.storage_and_layout();
+                let v_data: &[f32] = match &*v_g {
+                    Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[v_l.start_offset()..],
+                    _ => candle::bail!("Expected CPU storage"),
+                };
+
+                // Write K, V into raw cache (no tensor allocation)
+                let k_len = self.num_kv_heads * self.head_dim;
+                let rc = self.raw_cache.as_mut().unwrap();
+                rc.write_kv(&k_data[..k_len], &v_data[..k_len]);
+
+                // Run interleaved decode kernel
+                let kv_len = rc.len();
+                let q_len = self.num_heads * self.head_dim;
+                let ctx = causal_decode_f32_interleaved(
+                    &q_data[..q_len],
+                    rc.data(),
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    kv_len,
+                    scale,
+                )?;
+
+                let ctx = ctx.unsqueeze(0)?.transpose(1, 2)?;
+                ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
             } else {
-                m.clone()
-            };
-            scores = scores.broadcast_add(&mask)?;
+                // Prefill: interleaved cache + flash_attn; also populate raw cache for decode.
+                let ic = self.interleaved_cache.as_mut().unwrap();
+                let kv = ic.append(&k, &v)?;
+
+                // Populate raw cache for subsequent decode steps
+                {
+                    let k_cont = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                    let v_cont = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+                    let (kg, kl) = k_cont.storage_and_layout();
+                    let k_d: &[f32] = match &*kg {
+                        Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[kl.start_offset()..],
+                        _ => candle::bail!("Expected CPU"),
+                    };
+                    let (vg, vl) = v_cont.storage_and_layout();
+                    let v_d: &[f32] = match &*vg {
+                        Storage::Cpu(cpu) => &cpu.as_slice::<f32>()?[vl.start_offset()..],
+                        _ => candle::bail!("Expected CPU"),
+                    };
+                    self.raw_cache.as_mut().unwrap().write_kv_batch(k_d, v_d, l);
+                }
+
+                let kv_k = kv.narrow(2, 0, self.head_dim)?.unsqueeze(0)?;
+                let kv_v = kv.narrow(2, self.head_dim, self.head_dim)?.unsqueeze(0)?;
+
+                let q = q.transpose(1, 2)?.contiguous()?;
+                let k = kv_k.contiguous()?;
+                let v = kv_v.contiguous()?;
+
+                let ctx = flash_attn::<f32>(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    AttnMask::causal_with_offset(offset),
+                    None,
+                    None,
+                )?;
+                let ctx = ctx.transpose(1, 2)?;
+                ctx.reshape((b, l, self.hidden_size))?.apply(&self.o_proj)
+            }
+        } else {
+            // Standard matmul attention (no flash)
+            let (k, v) = self.kv_cache.as_mut().unwrap().append(&k, &v)?;
+
+            let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
+            let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+            if let Some(m) = attn_mask {
+                let scores_dtype = scores.dtype();
+                let mask = if m.dtype() != scores_dtype {
+                    m.to_dtype(scores_dtype)?
+                } else {
+                    m.clone()
+                };
+                scores = scores.broadcast_add(&mask)?;
+            }
+            let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+            let ctx = probs.matmul(&v)?;
+            let reshaped_ctx = ctx.transpose(1, 2)?.reshape((b, l, self.hidden_size))?;
+            self.o_proj.forward(&reshaped_ctx)
         }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // (B, H, L, D)
-        let reshaped_ctx = ctx
-            .transpose(1, 2)?
-            .reshape((b, l, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&reshaped_ctx)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        if let Some(c) = &mut self.kv_cache {
+            c.reset();
+        }
+        if let Some(c) = &mut self.interleaved_cache {
+            c.reset();
+        }
+        if let Some(c) = &mut self.raw_cache {
+            c.reset();
+        }
     }
 }
 
@@ -254,6 +400,7 @@ struct LayerWeights {
 }
 
 impl LayerWeights {
+    #[allow(clippy::too_many_arguments)]
     fn new<R: Read + Seek>(
         gg: &mut Gguf<R>,
         num_attention_heads: usize,
@@ -261,6 +408,7 @@ impl LayerWeights {
         head_dim: usize,
         rms_norm_eps: f64,
         rotary: Arc<RotaryEmbedding>,
+        device: &Device,
         layer_idx: usize,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
@@ -274,6 +422,7 @@ impl LayerWeights {
             head_dim,
             rms_norm_eps,
             rotary,
+            device,
             &prefix,
         )?;
         let mlp = MlpWeights::new(gg, &prefix)?;
@@ -292,6 +441,10 @@ impl LayerWeights {
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
         x + h2
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -357,6 +510,7 @@ impl ModelWeights {
                 head_dim,
                 rms_norm_eps,
                 rotary.clone(),
+                device,
                 i,
             )?);
         }
@@ -413,7 +567,8 @@ impl ModelWeights {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
-        let causal_mask = if l == 1 {
+        // Skip mask materialization when using CPU flash attention
+        let causal_mask = if l == 1 || self.device.is_cpu() {
             None
         } else {
             Some(self.causal_mask(b, l, offset, None)?)
@@ -425,5 +580,11 @@ impl ModelWeights {
         let _enter = self.span_output.enter();
         let last_hidden = h.narrow(1, l - 1, 1)?;
         self.lm_head.forward(&last_hidden)?.squeeze(1)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.clear_kv_cache();
+        }
     }
 }

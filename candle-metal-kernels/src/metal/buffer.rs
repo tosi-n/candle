@@ -19,10 +19,6 @@ impl Buffer {
         Buffer { raw }
     }
 
-    pub fn as_ref(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &*self.raw
-    }
-
     pub fn contents(&self) -> *mut u8 {
         self.data()
     }
@@ -30,6 +26,12 @@ impl Buffer {
     pub fn data(&self) -> *mut u8 {
         use objc2_metal::MTLBuffer as _;
         self.as_ref().contents().as_ptr() as *mut u8
+    }
+
+    /// Get the raw pointer to the underlying Metal buffer object.
+    /// Used for dependency tracking in the compute encoder.
+    pub(crate) fn raw_ptr(&self) -> *const ProtocolObject<dyn MTLBuffer> {
+        Retained::as_ptr(&self.raw)
     }
 
     pub fn length(&self) -> usize {
@@ -41,10 +43,16 @@ impl Buffer {
     }
 }
 
-pub type BufferMap = HashMap<(usize, MTLResourceOptions), Vec<Arc<Buffer>>>;
-
-impl<'a> Into<&'a MetalResource> for &'a Buffer {
-    fn into(self) -> &'a MetalResource {
-        &ProtocolObject::from_ref(self.as_ref())
+impl AsRef<ProtocolObject<dyn MTLBuffer>> for Buffer {
+    fn as_ref(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.raw
     }
 }
+
+impl<'a> From<&'a Buffer> for &'a MetalResource {
+    fn from(val: &'a Buffer) -> Self {
+        ProtocolObject::from_ref(val.as_ref())
+    }
+}
+
+pub type BufferMap = HashMap<usize, Vec<Arc<Buffer>>>;

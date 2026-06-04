@@ -1,7 +1,8 @@
-use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
-use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
-use objc2_metal::MTLResourceUsage;
+use crate::{get_tile_size, linear_split};
+use crate::{
+    set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Output, Source,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_affine(
@@ -9,6 +10,7 @@ pub fn call_affine(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     name: &'static str,
+    dtype_size: usize,
     size: usize,
     input: BufferOffset,
     output: &Buffer,
@@ -21,11 +23,11 @@ pub fn call_affine(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (size, mul, add, &input, output));
+    set_params!(encoder, (size, mul, add, &input, Output::new(output)));
 
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, size);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
+    let tile_size = get_tile_size(dtype_size);
+    let tiles = size.div_ceil(tile_size);
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -60,13 +62,11 @@ pub fn call_affine_strided(
             mul,
             add,
             &input,
-            output
+            Output::new(output)
         )
     );
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, size);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -77,6 +77,7 @@ pub fn call_powf(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     name: &'static str,
+    dtype_size: usize,
     size: usize,
     input: BufferOffset,
     output: &Buffer,
@@ -88,11 +89,11 @@ pub fn call_powf(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (size, mul, &input, output));
+    set_params!(encoder, (size, mul, &input, Output::new(output)));
 
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, size);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
+    let tile_size = get_tile_size(dtype_size);
+    let tiles = size.div_ceil(tile_size);
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -118,12 +119,18 @@ pub fn call_powf_strided(
 
     set_params!(
         encoder,
-        (size, shape.len(), shape, input_stride, mul, &input, output)
+        (
+            size,
+            shape.len(),
+            shape,
+            input_stride,
+            mul,
+            &input,
+            Output::new(output)
+        )
     );
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, size);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -134,6 +141,7 @@ pub fn call_elu(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     name: &'static str,
+    dtype_size: usize,
     size: usize,
     input: BufferOffset,
     output: &Buffer,
@@ -145,11 +153,11 @@ pub fn call_elu(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    set_params!(encoder, (size, mul, &input, output));
+    set_params!(encoder, (size, mul, &input, Output::new(output)));
 
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, size);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
+    let tile_size = get_tile_size(dtype_size);
+    let tiles = size.div_ceil(tile_size);
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
@@ -175,12 +183,18 @@ pub fn call_elu_strided(
 
     set_params!(
         encoder,
-        (size, shape.len(), shape, input_stride, mul, &input, output)
+        (
+            size,
+            shape.len(),
+            shape,
+            input_stride,
+            mul,
+            &input,
+            Output::new(output)
+        )
     );
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, size);
-    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
-    encoder.use_resource(output, MTLResourceUsage::Write);
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }

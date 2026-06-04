@@ -1,6 +1,8 @@
 use crate::utils::EncoderProvider;
-use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
-use objc2_metal::{MTLResourceUsage, MTLSize};
+use crate::{
+    set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Output, Source,
+};
+use objc2_metal::MTLSize;
 
 #[derive(Debug, Clone, Copy)]
 pub enum GgmlDType {
@@ -148,7 +150,7 @@ pub fn call_quantized_matmul_mv_t(
         (
             rhs,
             (lhs, lhs_offset),
-            (dst, dst_offset),
+            Output::with_offset(dst, dst_offset),
             ne00,
             ne01,
             ne02,
@@ -167,9 +169,6 @@ pub fn call_quantized_matmul_mv_t(
             r3
         )
     );
-    encoder.use_resource(lhs, MTLResourceUsage::Read);
-    encoder.use_resource(rhs, MTLResourceUsage::Read);
-    encoder.use_resource(dst, MTLResourceUsage::Write);
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -234,16 +233,16 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f32",
         GgmlDType::Q5_1 => "kernel_mul_mm_q5_1_f32",
         GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_f32",
-        GgmlDType::Q8_1 => "kernel_mul_mm_q8_1_f32",
         GgmlDType::Q2K => "kernel_mul_mm_q2_K_f32",
         GgmlDType::Q3K => "kernel_mul_mm_q3_K_f32",
         GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32",
         GgmlDType::Q5K => "kernel_mul_mm_q5_K_f32",
         GgmlDType::Q6K => "kernel_mul_mm_q6_K_f32",
-        GgmlDType::Q8K => "kernel_mul_mm_q8_K_f32",
         GgmlDType::F16 => "kernel_mul_mm_f16_f32",
         GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mm_f32_f32",
+        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
+        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -256,7 +255,7 @@ pub fn call_quantized_matmul_mm_t(
         (
             src0,
             (src1, src1_offset),
-            (dst, dst_offset),
+            Output::with_offset(dst, dst_offset),
             ne00,
             ne02,
             nb01,
@@ -273,9 +272,6 @@ pub fn call_quantized_matmul_mm_t(
             r3
         )
     );
-    encoder.use_resource(src0, MTLResourceUsage::Read);
-    encoder.use_resource(src1, MTLResourceUsage::Read);
-    encoder.use_resource(dst, MTLResourceUsage::Write);
 
     encoder.set_threadgroup_memory_length(0, 8192);
 

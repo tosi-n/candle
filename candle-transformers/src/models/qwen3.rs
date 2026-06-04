@@ -358,6 +358,35 @@ impl Qwen3Attention {
             .apply(&self.o_proj)
     }
 
+    /// Differentiable attention for TRAINING: standard matmul+softmax path (every op
+    /// has a backward), no stateful KV cache. `&self` — no mutation.
+    pub(crate) fn forward_train(
+        &self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+        let q = q
+            .reshape((b, l, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let q_flat = self.q_norm.forward(&q.flatten(0, 2)?)?;
+        let k_flat = self.k_norm.forward(&k.flatten(0, 2)?)?;
+        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
+        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+        self.forward_standard_attn(&q, &k, &v, attn_mask, b, l)
+    }
+
     pub(crate) fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
     }
@@ -392,6 +421,16 @@ impl DecoderLayer {
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
         let h = self.self_attn.forward(&h, mask, offset)?;
+        let x = (x + h)?;
+        let h2 = self.ln2.forward(&x)?;
+        let h2 = h2.apply(&self.mlp)?;
+        x + h2
+    }
+
+    /// Differentiable layer forward for TRAINING (standard attention, no KV cache).
+    fn forward_train(&self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        let h = self.ln1.forward(x)?;
+        let h = self.self_attn.forward_train(&h, mask, offset)?;
         let x = (x + h)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
@@ -465,8 +504,23 @@ impl Model {
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        let (b, l) = input.dims2()?;
-        let mut h = self.embed_tokens.forward(input)?;
+        let h = self.embed(input)?;
+        self.forward_embeds(&h, offset)
+    }
+
+    /// Embedding lookup for token ids `[b, l]` -> hidden states `[b, l, hidden]`.
+    /// Exposed so callers can assemble `inputs_embeds` (e.g. splice projected
+    /// image/audio tokens beside text tokens) and feed them to `forward_embeds`.
+    pub fn embed(&self, input: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input)
+    }
+
+    /// Forward from precomputed input embeddings `[b, l, hidden]` instead of token
+    /// ids. Identical to `forward` minus the embedding lookup, so
+    /// `forward(ids) == forward_embeds(embed(ids))` by construction.
+    pub fn forward_embeds(&mut self, inputs_embeds: &Tensor, offset: usize) -> Result<Tensor> {
+        let (b, l, _) = inputs_embeds.dims3()?;
+        let mut h = inputs_embeds.clone();
 
         // Build causal mask only for the standard attention fallback path.
         // Both CPU flash and GPU flash handle masking internally.
@@ -482,6 +536,23 @@ impl Model {
 
         for layer in &mut self.layers {
             h = layer.forward(&h, causal.as_ref(), offset)?;
+        }
+        self.norm.forward(&h)
+    }
+
+    /// Differentiable forward from embeddings for TRAINING: standard attention path
+    /// with an explicit causal mask, no stateful KV cache. `&self` — no mutation, so
+    /// it can run inside an autograd graph without aliasing cache state.
+    pub fn forward_embeds_train(&self, inputs_embeds: &Tensor, offset: usize) -> Result<Tensor> {
+        let (b, l, _) = inputs_embeds.dims3()?;
+        let causal = if l > 1 {
+            Some(self.causal_mask(b, l, offset, None)?)
+        } else {
+            None
+        };
+        let mut h = inputs_embeds.clone();
+        for layer in &self.layers {
+            h = layer.forward_train(&h, causal.as_ref(), offset)?;
         }
         self.norm.forward(&h)
     }
@@ -505,14 +576,131 @@ impl ModelForCausalLM {
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        let (_, l) = input.dims2()?;
+        let embeds = self.base.embed(input)?;
+        self.forward_embeds(&embeds, offset)
+    }
+
+    /// Embedding lookup for token ids `[b, l]` -> `[b, l, hidden]`. Lets callers
+    /// build `inputs_embeds` for `forward_embeds`.
+    pub fn embed(&self, input: &Tensor) -> Result<Tensor> {
+        self.base.embed(input)
+    }
+
+    /// Forward from precomputed input embeddings `[b, l, hidden]`, returning logits
+    /// for the last position `[b, 1, vocab]`.
+    pub fn forward_embeds(&mut self, inputs_embeds: &Tensor, offset: usize) -> Result<Tensor> {
+        let (_, l, _) = inputs_embeds.dims3()?;
         self.base
-            .forward(input, offset)?
+            .forward_embeds(inputs_embeds, offset)?
             .narrow(1, l - 1, 1)?
+            .apply(&self.lm_head)
+    }
+
+    /// Like `forward_embeds` but returns logits for ALL positions `[b, seq, vocab]`,
+    /// for teacher-forced training loss over a response span.
+    pub fn forward_embeds_all(&mut self, inputs_embeds: &Tensor, offset: usize) -> Result<Tensor> {
+        self.base
+            .forward_embeds(inputs_embeds, offset)?
+            .apply(&self.lm_head)
+    }
+
+    /// Differentiable all-position logits for TRAINING (standard attention, no KV
+    /// cache). `&self`. Use this for teacher-forced loss; `forward_embeds_all` uses the
+    /// inference attention path (flash on CPU) which has no backward.
+    pub fn forward_embeds_all_train(&self, inputs_embeds: &Tensor, offset: usize) -> Result<Tensor> {
+        self.base
+            .forward_embeds_train(inputs_embeds, offset)?
             .apply(&self.lm_head)
     }
 
     pub fn clear_kv_cache(&mut self) {
         self.base.clear_kv_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, ModelForCausalLM};
+    use candle::{DType, Device, Result, Tensor};
+    use candle_nn::{Activation, VarBuilder, VarMap};
+
+    fn tiny_cfg() -> Config {
+        Config {
+            vocab_size: 32,
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            head_dim: 8,
+            attention_bias: false,
+            num_key_value_heads: 1,
+            max_position_embeddings: 64,
+            sliding_window: None,
+            max_window_layers: 0,
+            tie_word_embeddings: true,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: Activation::Silu,
+        }
+    }
+
+    fn random_model(cfg: &Config, device: &Device) -> Result<ModelForCausalLM> {
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
+        let model = ModelForCausalLM::new(cfg, vb)?;
+        // Overwrite the zero-initialized vars with random values in place; the model
+        // shares storage with these vars, so it observes the randomized weights.
+        for v in varmap.all_vars() {
+            let r = Tensor::randn(0f32, 1f32, v.as_tensor().shape().clone(), device)?;
+            v.set(&r)?;
+        }
+        Ok(model)
+    }
+
+    /// `forward(ids)` must equal `forward_embeds(embed(ids))` — the splice path is a
+    /// faithful bypass of the embedding lookup.
+    #[test]
+    fn forward_embeds_matches_token_forward() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let mut model = random_model(&cfg, &device)?;
+
+        let ids = Tensor::from_vec(vec![1i64, 2, 3, 4, 5], (1, 5), &device)?;
+        let logits_tok = model.forward(&ids, 0)?;
+        model.clear_kv_cache();
+        let embeds = model.embed(&ids)?;
+        let logits_emb = model.forward_embeds(&embeds, 0)?;
+        model.clear_kv_cache();
+
+        assert_eq!(logits_tok.dims(), logits_emb.dims());
+        let diff = (logits_tok - logits_emb)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "splice mismatch: max abs diff = {diff}");
+        Ok(())
+    }
+
+    /// Arbitrary spliced vectors (standing in for projected image/audio tokens) must
+    /// flow through `forward_embeds` and produce finite last-position logits.
+    #[test]
+    fn forward_embeds_accepts_spliced_vectors() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let mut model = random_model(&cfg, &device)?;
+
+        let bos = model.embed(&Tensor::from_vec(vec![1i64], (1, 1), &device)?)?;
+        let modality = Tensor::randn(0f32, 1f32, (1usize, 3, cfg.hidden_size), &device)?;
+        let prompt = model.embed(&Tensor::from_vec(vec![2i64, 3, 4], (1, 3), &device)?)?;
+        let inputs_embeds = Tensor::cat(&[&bos, &modality, &prompt], 1)?;
+
+        let logits = model.forward_embeds(&inputs_embeds, 0)?;
+        model.clear_kv_cache();
+
+        assert_eq!(logits.dims(), &[1usize, 1, cfg.vocab_size]);
+        let vals = logits.flatten_all()?.to_vec1::<f32>()?;
+        assert!(vals.iter().all(|x| x.is_finite()), "non-finite logits");
+        Ok(())
     }
 }

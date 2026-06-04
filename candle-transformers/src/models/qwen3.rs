@@ -97,28 +97,28 @@ impl Module for Qwen3MLP {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Qwen3Attention {
+pub struct Qwen3Attention {
     // projections
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
     // norms
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    pub q_norm: RmsNorm,
+    pub k_norm: RmsNorm,
     // hyper params
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    hidden_size: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub num_kv_groups: usize,
+    pub head_dim: usize,
+    pub hidden_size: usize,
     // utils
     rotary_emb: Arc<Qwen3RotaryEmbedding>,
     kv_cache: ConcatKvCache,
 }
 
 impl Qwen3Attention {
-    pub(crate) fn new(
+    pub fn new(
         cfg: &Config,
         rotary_emb: Arc<Qwen3RotaryEmbedding>,
         vb: VarBuilder,
@@ -184,7 +184,7 @@ impl Qwen3Attention {
         })
     }
 
-    pub(crate) fn forward(
+    pub fn forward(
         &mut self,
         x: &Tensor,
         attn_mask: Option<&Tensor>,
@@ -358,21 +358,84 @@ impl Qwen3Attention {
             .apply(&self.o_proj)
     }
 
-    pub(crate) fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
+    }
+    
+    /// Forward pass with K/V extraction - returns attention output and stores K/V in kv_pairs
+    #[cfg(feature = "internal")]
+    pub fn forward_with_kv_extraction(
+        &mut self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        offset: usize,
+        kv_pairs: &mut Vec<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+
+        // 1. Proj
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        // 2. Reshape: (B, L, H, D) -> (B, H, L, D)
+        let q = q
+            .reshape((b, l, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // 3. Per‑head RMSNorm
+        let q_flat = q.flatten(0, 2)?;
+        let k_flat = k.flatten(0, 2)?;
+        let q_flat = self.q_norm.forward(&q_flat)?;
+        let k_flat = self.k_norm.forward(&k_flat)?;
+        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
+        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+
+        // 4. RoPE
+        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+
+        // 5. Store K/V before caching (for extraction)
+        kv_pairs.push((k.clone(), v.clone()));
+
+        // 6. Accumulate KV cache
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+
+        // 7. GQA repeat_kv
+        let k = repeat_kv(k, self.num_kv_groups)?;
+        let v = repeat_kv(v, self.num_kv_groups)?;
+
+        // 8. Attention score
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        if let Some(m) = attn_mask {
+            scores = scores.broadcast_add(m)?;
+        }
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let ctx = probs.matmul(&v)?; // (B, H, L, D)
+
+        // 9. Output proj
+        ctx.transpose(1, 2)?
+            .reshape((b, l, self.hidden_size))?
+            .apply(&self.o_proj)
     }
 }
 
 #[derive(Debug, Clone)]
-struct DecoderLayer {
-    self_attn: Qwen3Attention,
-    mlp: Qwen3MLP,
-    ln1: RmsNorm,
-    ln2: RmsNorm,
+pub struct DecoderLayer {
+    pub self_attn: Qwen3Attention,
+    pub mlp: Qwen3MLP,
+    pub ln1: RmsNorm,
+    pub ln2: RmsNorm,
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
         let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
         let mlp = Qwen3MLP::new(cfg, vb.pp("mlp"))?;
         let ln1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -389,7 +452,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
         let h = self.self_attn.forward(&h, mask, offset)?;
         let x = (x + h)?;
@@ -398,18 +461,29 @@ impl DecoderLayer {
         x + h2
     }
 
-    fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+    
+    /// Forward pass with K/V extraction from attention layer
+    #[cfg(feature = "internal")]
+    pub fn forward_with_kv_extraction(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize, kv_pairs: &mut Vec<(Tensor, Tensor)>) -> Result<Tensor> {
+        let h = self.ln1.forward(x)?;
+        let h = self.self_attn.forward_with_kv_extraction(&h, mask, offset, kv_pairs)?;
+        let x = (x + h)?;
+        let h2 = self.ln2.forward(&x)?;
+        let h2 = h2.apply(&self.mlp)?;
+        Ok((x + h2)?)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    embed_tokens: candle_nn::Embedding,
-    layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
-    device: Device,
-    dtype: DType,
+    pub embed_tokens: candle_nn::Embedding,
+    pub layers: Vec<DecoderLayer>,
+    pub norm: RmsNorm,
+    pub device: Device,
+    pub dtype: DType,
 }
 
 impl Model {
@@ -431,7 +505,7 @@ impl Model {
         })
     }
 
-    fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         for l in &mut self.layers {
             l.clear_kv_cache();
         }
@@ -485,12 +559,30 @@ impl Model {
         }
         self.norm.forward(&h)
     }
+    
+    /// Forward pass with K/V collection from each layer
+    #[cfg(feature = "internal")]
+    pub fn forward_with_kv_collection(&mut self, input: &Tensor, offset: usize, kv_pairs: &mut Vec<(Tensor, Tensor)>) -> Result<Tensor> {
+        let (b, l) = input.dims2()?;
+        let mut h = self.embed_tokens.forward(input)?;
+
+        let causal = if l == 1 {
+            None
+        } else {
+            Some(self.causal_mask(b, l, offset, None)?)
+        };
+
+        for layer in &mut self.layers {
+            h = layer.forward_with_kv_extraction(&h, causal.as_ref(), offset, kv_pairs)?;
+        }
+        self.norm.forward(&h)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelForCausalLM {
-    base: Model,
-    lm_head: Linear,
+    pub base: Model,
+    pub lm_head: Linear,
 }
 
 impl ModelForCausalLM {
@@ -514,5 +606,23 @@ impl ModelForCausalLM {
 
     pub fn clear_kv_cache(&mut self) {
         self.base.clear_kv_cache();
+    }
+    
+    /// Extract K/V tensors from all layers after forward pass
+    /// Returns Vec<(K, V)> where each tuple contains the K,V tensors for a layer
+    /// K,V shapes: [batch, num_kv_heads, seq_len, head_dim]
+    #[cfg(feature = "internal")]
+    pub fn forward_with_kv_extraction(&mut self, input: &Tensor, offset: usize) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
+        let (_, l) = input.dims2()?;
+        
+        // Run forward pass and collect K/V from each layer
+        let mut kv_pairs = Vec::new();
+        let hidden_states = self.base.forward_with_kv_collection(input, offset, &mut kv_pairs)?;
+        
+        let logits = hidden_states
+            .narrow(1, l - 1, 1)?
+            .apply(&self.lm_head)?;
+            
+        Ok((logits, kv_pairs))
     }
 }

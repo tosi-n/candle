@@ -23,9 +23,12 @@
 //! - [x] `config.rs` — serde structs mirroring the released config.json.
 //! - [x] `audio_encoder.rs` — Whisper-style 128-mel encoder, ÷4, → 2048.
 //! - [x] `vision_encoder.rs` — Qwen2.5-VL windowed-attn ViT + PatchMerger.
-//! - [ ] `mrope.rs` — M-RoPE sectioning (shared thinker + talker).
-//! - [ ] `thinker.rs` — Qwen2.5 LLM + multimodal embed merge.
-//! - [ ] `talker.rs` — Qwen2 LLM + codec_head + AR sampling.
+//! - [x] `mrope.rs` — M-RoPE sectioning (shared thinker + talker).
+//! - [x] `thinker.rs` — Qwen2.5 LLM text-only forward + lm_head. Multimodal
+//!       embed splice + KV cache are Phase 2.5 follow-ups.
+//! - [x] `talker.rs` — Qwen2 LLM + codec_head + thinker_to_talker_proj.
+//!       Per-step rolling-buffer fusion + sampling are Phase 3.5
+//!       follow-ups (wired into the decode loop).
 //! - [ ] `token2wav/` — dit.rs, flow_match.rs, ecapa_tdnn.rs, bigvgan.rs.
 //! - [ ] `inference.rs` — end-to-end `generate()`.
 //!
@@ -35,6 +38,9 @@
 
 pub mod audio_encoder;
 pub mod config;
+pub mod mrope;
+pub mod talker;
+pub mod thinker;
 pub mod vision_encoder;
 
 pub use audio_encoder::AudioEncoder;
@@ -42,4 +48,7 @@ pub use config::{
     AudioEncoderConfig, BigVganConfig, DitConfig, OmniConfig, TalkerConfig, ThinkerConfig,
     ThinkerTextConfig, Token2WavConfig, VisionEncoderConfig,
 };
+pub use mrope::{text_only_position_ids, MRopeTable};
+pub use talker::Talker;
+pub use thinker::Thinker;
 pub use vision_encoder::VisionEncoder;

@@ -29,7 +29,13 @@
 //! - [x] `talker.rs` — Qwen2 LLM + codec_head + thinker_to_talker_proj.
 //!       Per-step rolling-buffer fusion + sampling are Phase 3.5
 //!       follow-ups (wired into the decode loop).
-//! - [ ] `token2wav/` — dit.rs, flow_match.rs, ecapa_tdnn.rs, bigvgan.rs.
+//! - [~] `token2wav/`:
+//!     - [x] `flow_match.rs` — Kutta 3/8-rule ODE solver + sway schedule
+//!           + CFG combine. Pure numerical primitives, closed-form
+//!           verified.
+//!     - [ ] `dit.rs` — DiT flow-matching velocity field (22 blocks).
+//!     - [ ] `bigvgan.rs` — Anti-aliased SnakeBeta vocoder.
+//!     - [ ] `ecapa_tdnn.rs` — Speaker encoder for voice cloning.
 //! - [ ] `inference.rs` — end-to-end `generate()`.
 //!
 //! Each stage is built and weight-load/parity-tested on a Lambda GPU box
@@ -41,6 +47,7 @@ pub mod config;
 pub mod mrope;
 pub mod talker;
 pub mod thinker;
+pub mod token2wav;
 pub mod vision_encoder;
 
 pub use audio_encoder::AudioEncoder;
@@ -51,4 +58,5 @@ pub use config::{
 pub use mrope::{text_only_position_ids, MRopeTable};
 pub use talker::Talker;
 pub use thinker::Thinker;
+pub use token2wav::{cfg_combine, sway_schedule, RungeKutta38Solver};
 pub use vision_encoder::VisionEncoder;

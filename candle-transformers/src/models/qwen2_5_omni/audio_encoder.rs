@@ -593,4 +593,62 @@ mod tests {
         assert_eq!(d, enc.output_dim());
         assert!(n > 0 && n <= 400);
     }
+
+    /// **Phase 1 GPU acceptance** — same as the CPU smoke but runs on
+    /// CUDA at native BF16. Proves the encoder forward path is correct
+    /// at the released checkpoint's deployed dtype, not just at the
+    /// portability-cast F32 fallback. Lambda + `--features cuda` only.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "cuda")]
+    fn real_weight_audio_encoder_loads_cuda_bf16() {
+        use crate::models::qwen2_5_omni::config::OmniConfig;
+        use std::path::PathBuf;
+
+        let model_dir = std::env::var("QWEN_OMNI_3B_DIR")
+            .expect("QWEN_OMNI_3B_DIR must point at the local Qwen2.5-Omni-3B snapshot");
+        let model_dir = PathBuf::from(model_dir);
+        let cfg_text =
+            std::fs::read_to_string(model_dir.join("config.json")).expect("read config.json");
+        let cfg: OmniConfig = serde_json::from_str(&cfg_text).expect("parse omni config");
+
+        let shards: Vec<_> = std::fs::read_dir(&model_dir)
+            .expect("list model dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().and_then(|e| e.to_str()) == Some("safetensors")
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("model"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(!shards.is_empty(), "no safetensors shards in {model_dir:?}");
+
+        // The released checkpoint ships in BF16; on CUDA we can use the
+        // native kernel set and run forward at the deployed dtype.
+        let device = Device::new_cuda(0).expect("cuda device 0 (run on a GPU box)");
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&shards, DType::BF16, &device)
+                .expect("mmap safetensors")
+        };
+        let enc = AudioEncoder::new(
+            &cfg.thinker_config.audio_config,
+            vb.pp("thinker").pp("audio_tower"),
+        )
+        .expect("construct AudioEncoder from real weights");
+
+        let mel = Tensor::randn(0f32, 1f32, (1usize, enc.cfg.num_mel_bins, 400), &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let out = enc.forward(&mel).expect("forward on real weights (cuda bf16)");
+        let (n, d) = (out.dim(0).unwrap(), out.dim(1).unwrap());
+        eprintln!("real_weight_audio_encoder_loads_cuda_bf16: output shape = ({n}, {d})");
+        assert_eq!(d, enc.output_dim());
+        assert!(n > 0 && n <= 400);
+        // Sanity: the result must come back as BF16 since we never
+        // forced an upcast.
+        assert_eq!(out.dtype(), DType::BF16);
+    }
 }

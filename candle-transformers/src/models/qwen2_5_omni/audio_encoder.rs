@@ -566,8 +566,11 @@ mod tests {
         assert!(!shards.is_empty(), "no safetensors shards in {model_dir:?}");
 
         let device = Device::Cpu; // weight-load smoke — no inference, just construction
+        // Released weights are bf16 on disk; cast to F32 on read so the
+        // smoke runs on CPU (candle's CPU matmul has no bf16 kernel —
+        // GPU bf16 lives in Phase 2 alongside the Thinker integration).
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&shards, DType::BF16, &device)
+            VarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)
                 .expect("mmap safetensors")
         };
         let enc = AudioEncoder::new(
@@ -578,10 +581,8 @@ mod tests {
 
         // Tiny forward at the real dims (128 mel bins, 400 frames = 4 s
         // of 100 fps mel) to prove the conv stack + a couple of layers
-        // execute without panic. Cast to f32 for CPU sanity.
+        // execute without panic.
         let mel = Tensor::randn(0f32, 1f32, (1usize, enc.cfg.num_mel_bins, 400), &device)
-            .unwrap()
-            .to_dtype(DType::BF16)
             .unwrap();
         let out = enc.forward(&mel).expect("forward on real weights");
         // ÷4 downsample on 400 mel frames → ~100 tokens. With chunking

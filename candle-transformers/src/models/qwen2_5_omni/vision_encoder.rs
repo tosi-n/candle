@@ -690,9 +690,12 @@ mod tests {
             .collect();
         assert!(!shards.is_empty(), "no safetensors shards in {model_dir:?}");
 
+        // Released weights are bf16 on disk; cast to F32 on read so the
+        // smoke runs on CPU (candle's CPU matmul has no bf16 kernel —
+        // GPU bf16 lives in Phase 2 alongside the Thinker integration).
         let device = Device::Cpu;
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&shards, DType::BF16, &device)
+            VarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)
                 .expect("mmap safetensors")
         };
         let enc = VisionEncoder::new(
@@ -706,10 +709,7 @@ mod tests {
         let patch_dim =
             vision_cfg.in_channels * vision_cfg.temporal_patch_size * vision_cfg.patch_size.pow(2);
         let n = 4;
-        let patches = Tensor::randn(0f32, 1f32, (n, patch_dim), &device)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
+        let patches = Tensor::randn(0f32, 1f32, (n, patch_dim), &device).unwrap();
         let out = enc.forward(&patches, (1, 2, 2)).expect("forward on real weights");
         let (n, d) = (out.dim(0).unwrap(), out.dim(1).unwrap());
         eprintln!("real_weight_vision_encoder_loads: output shape = ({n}, {d})");

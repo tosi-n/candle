@@ -1249,13 +1249,18 @@ mod tests {
             .all(|x| x.is_finite()));
     }
 
-    /// **Phase 4 GPU acceptance — real-weight CUDA BF16 smoke.** Same as
-    /// the CPU smoke but on CUDA at the deployed BF16 dtype. Lambda +
-    /// `--features cuda` only.
+    /// **Phase 4 GPU acceptance — real-weight CUDA F32 smoke.**
+    ///
+    /// Token2Wav (DiT) is **fp32-only** in the released model (upstream
+    /// forces `self.token2wav.float()`; `dit_config.torch_dtype="float32"`).
+    /// candle's CUDA backend has no BF16 kernels for the DiT op chain, and
+    /// the model never runs that config — so this GPU test loads + runs at
+    /// **F32 on CUDA**, the actual deployment dtype. Lambda + `--features
+    /// cuda` only.
     #[test]
     #[ignore]
     #[cfg(feature = "cuda")]
-    fn real_weight_dit_loads_cuda_bf16() {
+    fn real_weight_dit_loads_cuda_f32() {
         use crate::models::qwen2_5_omni::config::OmniConfig;
         use std::path::PathBuf;
 
@@ -1281,8 +1286,9 @@ mod tests {
         assert!(!shards.is_empty(), "no safetensors shards in {model_dir:?}");
 
         let device = Device::new_cuda(0).expect("cuda device 0 (run on a GPU box)");
+        // F32 on GPU — Token2Wav is fp32-only.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&shards, DType::BF16, &device)
+            VarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)
                 .expect("mmap safetensors")
         };
         let model = DitModel::new(dit_cfg, vb.pp("token2wav").pp("code2wav_dit_model"))
@@ -1295,24 +1301,16 @@ mod tests {
             .unwrap()
             .reshape((1, n_codes))
             .unwrap();
-        let cond = Tensor::randn(0f32, 1f32, (1usize, dit_cfg.enc_emb_dim), &device)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
-        let ref_mel = Tensor::randn(0f32, 1f32, (1usize, 50usize, dit_cfg.mel_dim), &device)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
+        let cond = Tensor::randn(0f32, 1f32, (1usize, dit_cfg.enc_emb_dim), &device).unwrap();
+        let ref_mel =
+            Tensor::randn(0f32, 1f32, (1usize, 50usize, dit_cfg.mel_dim), &device).unwrap();
 
-        // sample() runs in the weight dtype (BF16 here) and only upcasts
-        // the softmax / rotary numerics, mirroring audio_encoder.rs. The
-        // mel therefore comes back BF16. Assert shape, dtype, finiteness.
         let mel = model
             .sample(&codes, &cond, &ref_mel, 2, 0.5, -1.0)
-            .expect("sample on real weights (cuda bf16)");
+            .expect("sample on real weights (cuda f32)");
         let dims = mel.dims().to_vec();
-        eprintln!("real_weight_dit_loads_cuda_bf16: mel shape = {dims:?}");
+        eprintln!("real_weight_dit_loads_cuda_f32: mel shape = {dims:?}");
         assert_eq!(dims, vec![1, dit_cfg.mel_dim, n_codes * dit_cfg.repeats]);
-        assert_eq!(mel.dtype(), DType::BF16);
+        assert_eq!(mel.dtype(), DType::F32);
     }
 }

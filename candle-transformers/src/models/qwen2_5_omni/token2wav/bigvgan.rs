@@ -923,12 +923,19 @@ mod tests {
         assert!(max <= 1.0, "max {max} > 1");
     }
 
-    /// **Phase 5 GPU acceptance** — same as the CPU smoke but native
-    /// BF16 on CUDA. Lambda + `--features cuda` only.
+    /// **Phase 5 GPU acceptance** — same as the CPU smoke but on CUDA.
+    ///
+    /// Token2Wav (DiT + BigVGAN) is **fp32-only** in the released model
+    /// — upstream forces `self.token2wav.float()` and the config carries
+    /// `dit_config.torch_dtype="float32"`. So this GPU test loads + runs
+    /// at **F32 on CUDA** (the actual deployment dtype), NOT BF16: candle's
+    /// CUDA backend has no BF16 kernels for the grouped conv-transpose +
+    /// Kaiser-sinc anti-alias chain, and the model never runs that config.
+    /// Lambda + `--features cuda` only.
     #[test]
     #[ignore]
     #[cfg(feature = "cuda")]
-    fn real_weight_bigvgan_loads_cuda_bf16() {
+    fn real_weight_bigvgan_loads_cuda_f32() {
         use crate::models::qwen2_5_omni::config::OmniConfig;
         use std::path::PathBuf;
 
@@ -953,8 +960,9 @@ mod tests {
         assert!(!shards.is_empty(), "no safetensors shards in {model_dir:?}");
 
         let device = Device::new_cuda(0).expect("cuda device 0 (run on a GPU box)");
+        // F32 on GPU — Token2Wav is fp32-only.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&shards, DType::BF16, &device)
+            VarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)
                 .expect("mmap safetensors")
         };
         let model = BigVgan::new(
@@ -963,12 +971,9 @@ mod tests {
         )
         .expect("construct BigVgan from real weights");
 
-        let mel = Tensor::randn(0f32, 1f32, (1usize, 80usize, 100usize), &device)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
-        let wav = model.forward(&mel).expect("forward on real weights (cuda bf16)");
+        let mel = Tensor::randn(0f32, 1f32, (1usize, 80usize, 100usize), &device).unwrap();
+        let wav = model.forward(&mel).expect("forward on real weights (cuda f32)");
         assert_eq!(wav.dims(), &[1, 1, 24000]);
-        assert_eq!(wav.dtype(), DType::BF16);
+        assert_eq!(wav.dtype(), DType::F32);
     }
 }

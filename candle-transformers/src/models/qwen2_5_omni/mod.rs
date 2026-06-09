@@ -29,13 +29,22 @@
 //! - [x] `talker.rs` — Qwen2 LLM + codec_head + thinker_to_talker_proj.
 //!       Per-step rolling-buffer fusion + sampling are Phase 3.5
 //!       follow-ups (wired into the decode loop).
-//! - [~] `token2wav/`:
+//! - [x] `token2wav/`:
 //!     - [x] `flow_match.rs` — Kutta 3/8-rule ODE solver + sway schedule
-//!           + CFG combine. Pure numerical primitives, closed-form
-//!           verified.
-//!     - [ ] `dit.rs` — DiT flow-matching velocity field (22 blocks).
-//!     - [ ] `bigvgan.rs` — Anti-aliased SnakeBeta vocoder.
-//!     - [ ] `ecapa_tdnn.rs` — Speaker encoder for voice cloning.
+//!           + CFG combine. Closed-form verified.
+//!     - [x] `dit.rs` — DiT flow-matching velocity field (22 blocks,
+//!           AdaLayerNormZero, block-causal streaming attn, GPT-J RoPE
+//!           on head 0). Shape + mask-window + interleaved-rotate tests.
+//!     - [x] `bigvgan.rs` — Anti-aliased SnakeBeta vocoder (Kaiser-sinc
+//!           filters match PyTorch; mel → 24 kHz). Shape/range tests.
+//!     - [x] `ecapa_tdnn.rs` — Speaker encoder (reflect-pad matches
+//!           PyTorch; → enc_dim 128). Shape + key-tree tests.
+//!     - [x] `Token2WavModel` — composes DiT + BigVGAN (codes → wav).
+//! - [x] `inference.rs` — `Qwen2_5OmniModel` composes Thinker + Talker +
+//!       Token2Wav. The elementwise-add fusion + codes→audio path are
+//!       wired + tested. Talker AR sampling loop + multimodal
+//!       `get_rope_index` + `spk_dict.pt` voice loader are documented
+//!       stubs (Phase 6.5).
 //! - [ ] `inference.rs` — end-to-end `generate()`.
 //!
 //! Each stage is built and weight-load/parity-tested on a Lambda GPU box
@@ -44,6 +53,7 @@
 
 pub mod audio_encoder;
 pub mod config;
+pub mod inference;
 pub mod mrope;
 pub mod talker;
 pub mod thinker;
@@ -55,8 +65,11 @@ pub use config::{
     AudioEncoderConfig, BigVganConfig, DitConfig, OmniConfig, TalkerConfig, ThinkerConfig,
     ThinkerTextConfig, Token2WavConfig, VisionEncoderConfig,
 };
+pub use inference::Qwen2_5OmniModel;
 pub use mrope::{text_only_position_ids, MRopeTable};
 pub use talker::Talker;
 pub use thinker::Thinker;
-pub use token2wav::{cfg_combine, sway_schedule, RungeKutta38Solver};
+pub use token2wav::{
+    cfg_combine, sway_schedule, BigVgan, DitModel, EcapaTdnn, RungeKutta38Solver, Token2WavModel,
+};
 pub use vision_encoder::VisionEncoder;

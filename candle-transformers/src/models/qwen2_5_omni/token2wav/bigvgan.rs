@@ -292,49 +292,56 @@ impl TorchActivation1d {
         })
     }
 
-    /// Depthwise kernel `(C, 1, K)` from the shared `(1, 1, K)` filter.
-    fn depthwise_kernel(&self, channels: usize) -> Result<Tensor> {
-        self.filter
-            .broadcast_as((channels, 1, AA_KERNEL_SIZE))?
-            .contiguous()
-    }
-
     /// `UpSample1d.forward` (ratio=2, kernel=12).
+    ///
+    /// The anti-alias filter is the SAME `(1, 1, K)` low-pass for every
+    /// channel, so a depthwise conv == applying that one kernel to each
+    /// channel independently. Rather than a grouped (`groups=C`)
+    /// conv-transpose — which candle's CUDA backend doesn't implement —
+    /// we fold channels into the batch axis `(B, C, T) → (B·C, 1, T)`
+    /// and run a `groups=1` conv-transpose with the shared `(1, 1, K)`
+    /// kernel, then reshape back. Numerically identical, CUDA-compatible.
     fn upsample(&self, x: &Tensor) -> Result<Tensor> {
-        let channels = x.dim(1)?;
+        let (b, c, _t) = x.dims3()?;
         // pad = kernel_size/ratio − 1 = 12/2 − 1 = 5 (replicate, both sides)
         let padded = replicate_pad1d(x, 5, 5)?;
-        let kernel = self.depthwise_kernel(channels)?;
+        let pt = padded.dim(D::Minus1)?;
+        let xr = padded.contiguous()?.reshape((b * c, 1, pt))?;
         let cfg = ConvTranspose1dConfig {
             padding: 0,
             output_padding: 0,
             stride: 2,
             dilation: 1,
-            groups: channels,
+            groups: 1,
         };
-        let convt = ConvTranspose1d::new(kernel, None, cfg);
+        let convt = ConvTranspose1d::new(self.filter.clone(), None, cfg);
         // output = ratio · conv_transpose1d(...)
-        let y = convt.forward(&padded)?.affine(2.0, 0.0)?;
+        let y = convt.forward(&xr)?.affine(2.0, 0.0)?;
+        let yt = y.dim(D::Minus1)?;
+        let y = y.reshape((b, c, yt))?;
         // slice [..., pad_left : -pad_right] = [..., 15 : T−15]
-        let t = y.dim(D::Minus1)?;
-        y.narrow(D::Minus1, 15, t - 30)
+        y.narrow(D::Minus1, 15, yt - 30)
     }
 
-    /// `DownSample1d.forward` (ratio=2, kernel=12).
+    /// `DownSample1d.forward` (ratio=2, kernel=12). Same batch-fold trick
+    /// as [`Self::upsample`] to avoid grouped conv on CUDA.
     fn downsample(&self, x: &Tensor) -> Result<Tensor> {
-        let channels = x.dim(1)?;
+        let (b, c, _t) = x.dims3()?;
         // even kernel: pad_left = k/2 − 1 = 5, pad_right = k/2 = 6 (replicate)
         let padded = replicate_pad1d(x, 5, 6)?;
-        let kernel = self.depthwise_kernel(channels)?;
+        let pt = padded.dim(D::Minus1)?;
+        let xr = padded.contiguous()?.reshape((b * c, 1, pt))?;
         let cfg = Conv1dConfig {
             padding: 0,
             stride: 2,
             dilation: 1,
-            groups: channels,
+            groups: 1,
             cudnn_fwd_algo: None,
         };
-        let conv = Conv1d::new(kernel, None, cfg);
-        conv.forward(&padded)
+        let conv = Conv1d::new(self.filter.clone(), None, cfg);
+        let y = conv.forward(&xr)?;
+        let yt = y.dim(D::Minus1)?;
+        y.reshape((b, c, yt))
     }
 
     /// upsample → SnakeBeta → downsample.

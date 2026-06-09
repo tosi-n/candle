@@ -21,8 +21,8 @@
 //! ## Port status
 //!
 //! - [x] `config.rs` — serde structs mirroring the released config.json.
-//! - [ ] `audio_encoder.rs` — Whisper-style 128-mel encoder, ÷4, → 2048.
-//! - [ ] `vision_encoder.rs` — Qwen2.5-VL windowed-attn ViT + PatchMerger.
+//! - [x] `audio_encoder.rs` — Whisper-style 128-mel encoder, ÷4, → 2048.
+//! - [x] `vision_encoder.rs` — Qwen2.5-VL windowed-attn ViT + PatchMerger.
 //! - [ ] `mrope.rs` — M-RoPE sectioning (shared thinker + talker).
 //! - [ ] `thinker.rs` — Qwen2.5 LLM + multimodal embed merge.
 //! - [ ] `talker.rs` — Qwen2 LLM + codec_head + AR sampling.
@@ -33,9 +33,13 @@
 //! (x86 + CUDA), never compiled locally — the weights are ~6 GB and the
 //! token2wav stack is forced fp32.
 
+pub mod audio_encoder;
 pub mod config;
+pub mod vision_encoder;
 
+pub use audio_encoder::AudioEncoder;
 pub use config::{
     AudioEncoderConfig, BigVganConfig, DitConfig, OmniConfig, TalkerConfig, ThinkerConfig,
     ThinkerTextConfig, Token2WavConfig, VisionEncoderConfig,
 };
+pub use vision_encoder::VisionEncoder;

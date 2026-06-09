@@ -22,6 +22,7 @@ impl Default for Conv3dConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct Conv3dNoBias {
     conv2d_1: Conv2d,
     conv2d_2: Conv2d,

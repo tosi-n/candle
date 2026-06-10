@@ -328,6 +328,86 @@ impl Thinker {
         let h = self.norm.forward(&h)?;
         self.lm_head.forward(&h)
     }
+
+    /// Embed `ids: (B, S)` through the Thinker's input embedding table,
+    /// returning `(B, S, hidden)`. Thin wrapper so the end-to-end
+    /// orchestrator (inference.rs) can place text-special tokens (BOS /
+    /// EOS / PAD) into the Talker prefill in Thinker-hidden space.
+    pub fn embed(&self, ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(ids)
+    }
+
+    /// Greedy text generation (`do_sample=false`). Starting from
+    /// `input_ids: (1, S)`, repeatedly runs the full causal forward
+    /// (no KV cache — full recompute each step), argmaxes the last
+    /// position, appends, and stops at `eos` or after `max_new` tokens.
+    ///
+    /// Returns ONLY the newly-generated ids `(1, G)` (G may be 0 if the
+    /// very first sampled token is `eos`). Batch size 1.
+    pub fn generate_greedy(&self, input_ids: &Tensor, max_new: usize, eos: i64) -> Result<Tensor> {
+        let (b, _) = input_ids.dims2()?;
+        if b != 1 {
+            candle::bail!("generate_greedy: batch size must be 1, got {b}");
+        }
+        let device = input_ids.device().clone();
+        let mut all: Vec<i64> = input_ids.flatten_all()?.to_vec1::<i64>()?;
+        let mut gen: Vec<i64> = Vec::with_capacity(max_new);
+        for _ in 0..max_new {
+            let cur = Tensor::from_vec(all.clone(), (1, all.len()), &device)?;
+            let logits = self.forward_text_only(&cur, 0)?;
+            let s = logits.dim(1)?;
+            // Last-position logits → argmax.
+            let last = logits.i((0, s - 1, ..))?.to_dtype(DType::F32)?;
+            let next = argmax_i64(&last)?;
+            gen.push(next);
+            all.push(next);
+            if next == eos {
+                break;
+            }
+        }
+        let g = gen.len();
+        Tensor::from_vec(gen, (1, g), &device)
+    }
+
+    /// Run a single full causal forward over `input_ids: (1, S)` and
+    /// capture two per-position tensors needed by the Talker fusion:
+    ///
+    /// - `last_hidden`: the decoder output AFTER the final RMSNorm but
+    ///   BEFORE `lm_head` — `(1, S, hidden=2048)`.
+    /// - `tok_embeds`: the layer-0 input embedding (`embed_tokens`) —
+    ///   `(1, S, hidden=2048)`.
+    ///
+    /// Because the decoder is causal, capturing both for ALL positions
+    /// in one pass over `[prompt + generated]` is identical to
+    /// capturing them step-by-step during generation (upstream's
+    /// approach), which is the simplification the orchestrator relies on.
+    pub fn forward_collect(&self, input_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (b, s) = input_ids.dims2()?;
+        let tok_embeds = self.embed_tokens.forward(input_ids)?;
+        let position_ids = text_only_position_ids(b, s, 0, tok_embeds.device())?;
+        let mut h = tok_embeds.clone();
+        for layer in &self.layers {
+            h = layer.forward(&h, &position_ids)?;
+        }
+        let last_hidden = self.norm.forward(&h)?;
+        Ok((last_hidden, tok_embeds))
+    }
+}
+
+/// Argmax over a 1-D F32 tensor, returning the index as i64. Used for
+/// greedy decode on CPU where a `to_vec1` + manual scan is simpler and
+/// dtype-safe than tensor `argmax` + cast.
+fn argmax_i64(v: &Tensor) -> Result<i64> {
+    let xs = v.to_vec1::<f32>()?;
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &x) in xs.iter().enumerate() {
+        if x > best_v {
+            best_v = x;
+            best = i;
+        }
+    }
+    Ok(best as i64)
 }
 
 #[cfg(test)]

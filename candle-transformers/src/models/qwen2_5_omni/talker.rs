@@ -58,6 +58,10 @@ struct Attention {
     n_kv_heads: usize,
     head_dim: usize,
     rotary: std::sync::Arc<MRopeTable>,
+    /// Per-layer KV cache for incremental AR decode: pre-`repeat_kv`
+    /// post-RoPE (k, v), each `(B, n_kv_heads, L, head_dim)`. `None`
+    /// between generations; `Talker::clear_kv_cache` resets it.
+    kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl Attention {
@@ -76,10 +80,11 @@ impl Attention {
             n_kv_heads,
             head_dim,
             rotary,
+            kv_cache: None,
         })
     }
 
-    fn forward(&self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+    fn forward(&mut self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let q = self
             .q_proj
@@ -102,6 +107,19 @@ impl Attention {
 
         let (q, k) = self.rotary.apply(&q, &k, position_ids)?;
 
+        // KV cache: append this chunk's (k, v) to the running cache so AR
+        // decode steps only compute attention for the NEW positions.
+        // `position_ids` must carry absolute positions for RoPE to match
+        // the cached entries.
+        let (k, v) = match &self.kv_cache {
+            None => (k, v),
+            Some((pk, pv)) => (
+                Tensor::cat(&[pk, &k], 2)?.contiguous()?,
+                Tensor::cat(&[pv, &v], 2)?.contiguous()?,
+            ),
+        };
+        self.kv_cache = Some((k.clone(), v.clone()));
+
         let groups = self.n_heads / self.n_kv_heads;
         let k = if groups > 1 { repeat_kv(&k, groups)? } else { k };
         let v = if groups > 1 { repeat_kv(&v, groups)? } else { v };
@@ -117,6 +135,10 @@ impl Attention {
             .reshape((b, s, self.n_heads * self.head_dim))?;
         self.o_proj.forward(&attn)
     }
+
+    fn clear_kv_cache(&mut self) {
+        self.kv_cache = None;
+    }
 }
 
 fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
@@ -126,16 +148,25 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
     x.reshape((b, kv * groups, s, d))
 }
 
+/// Causal mask over `(B, H, q_len, kv_len)` scores. With a KV cache the
+/// query rows sit at the END of the key axis: query row `i` may attend
+/// keys `j <= i + (kv_len − q_len)`. Decode steps (`q_len == 1`) attend
+/// everything, so the mask is skipped entirely.
 fn apply_causal_mask(scores: &Tensor) -> Result<Tensor> {
-    let s = scores.dim(D::Minus1)?;
+    let q = scores.dim(D::Minus2)?;
+    let kv = scores.dim(D::Minus1)?;
+    if q == 1 {
+        return Ok(scores.clone());
+    }
+    let offset = kv - q;
     let device = scores.device();
-    let mut row = Vec::with_capacity(s * s);
-    for i in 0..s {
-        for j in 0..s {
-            row.push(if j > i { f32::NEG_INFINITY } else { 0f32 });
+    let mut row = Vec::with_capacity(q * kv);
+    for i in 0..q {
+        for j in 0..kv {
+            row.push(if j > i + offset { f32::NEG_INFINITY } else { 0f32 });
         }
     }
-    let mask = Tensor::from_vec(row, (s, s), device)?
+    let mask = Tensor::from_vec(row, (q, kv), device)?
         .unsqueeze(0)?
         .unsqueeze(0)?;
     scores.broadcast_add(&mask)
@@ -195,7 +226,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+    fn forward(&mut self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         let residual = x;
         let h = self.input_layernorm.forward(x)?;
         let h = self.self_attn.forward(&h, position_ids)?;
@@ -204,6 +235,10 @@ impl DecoderLayer {
         let h = self.post_attention_layernorm.forward(&x)?;
         let h = self.mlp.forward(&h)?;
         residual + &h
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -303,18 +338,31 @@ impl Talker {
     /// **Critical fp32 cast on logits** (upstream line 2369): top-k /
     /// top-p / multinomial sampling in BF16 silently mis-samples around
     /// the threshold. The caller must sample in F32.
+    ///
+    /// **KV-cached**: each call appends this chunk's keys/values to the
+    /// per-layer cache, so AR decode passes ONE new token per step with
+    /// its absolute position id. Call [`Self::clear_kv_cache`] before a
+    /// new sequence (prefill).
     pub fn forward_from_projected_embeds(
-        &self,
+        &mut self,
         inputs_embeds: &Tensor,
         position_ids: &Tensor,
     ) -> Result<Tensor> {
         let mut h = inputs_embeds.clone();
-        for layer in &self.layers {
+        for layer in &mut self.layers {
             h = layer.forward(&h, position_ids)?;
         }
         let h = self.norm.forward(&h)?;
         // codec_head + force f32 for downstream sampling.
         self.codec_head.forward(&h)?.to_dtype(DType::F32)
+    }
+
+    /// Reset all per-layer KV caches. MUST be called before every new
+    /// generation — stale entries poison attention for the next sequence.
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.clear_kv_cache();
+        }
     }
 }
 
@@ -370,7 +418,7 @@ mod tests {
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
-        let talker = Talker::new(&cfg, vb)?;
+        let mut talker = Talker::new(&cfg, vb)?;
         randomize(&vm, &device)?;
 
         // Simulate the upstream fusion: a (1, 5, embedding_size=64)
@@ -509,12 +557,12 @@ mod tests {
             VarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)
                 .expect("mmap safetensors")
         };
-        let talker = Talker::new(&cfg.talker_config, vb.pp("talker"))
+        let mut talker = Talker::new(&cfg.talker_config, vb.pp("talker"))
             .expect("construct Talker from real weights");
 
         // Tiny forward: project a (1, 4, 2048) Thinker-like hidden + run
         // one decoder pass. Outputs (1, 4, 8448).
-        let cfg = talker.config();
+        let cfg = talker.config().clone();
         let h = Tensor::randn(0f32, 1f32, (1, 4, cfg.embedding_size), &device).unwrap();
         let projected = talker.project_thinker(&h).expect("projection");
         let pids = text_only_position_ids(1, 4, 0, &device).expect("pids");
@@ -562,9 +610,9 @@ mod tests {
             VarBuilder::from_mmaped_safetensors(&shards, DType::BF16, &device)
                 .expect("mmap safetensors")
         };
-        let talker = Talker::new(&cfg.talker_config, vb.pp("talker"))
+        let mut talker = Talker::new(&cfg.talker_config, vb.pp("talker"))
             .expect("construct Talker from real weights");
-        let cfg = talker.config();
+        let cfg = talker.config().clone();
         let h = Tensor::randn(0f32, 1f32, (1, 4, cfg.embedding_size), &device)
             .unwrap()
             .to_dtype(DType::BF16)

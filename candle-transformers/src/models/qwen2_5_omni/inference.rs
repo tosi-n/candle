@@ -52,7 +52,9 @@
 //!   shards at `DType::F32`.
 //! - **batch size 1** for audio output (`generate()` raises otherwise).
 
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
+#[cfg(test)]
+use candle::DType;
+use candle::{Device, IndexOp, Result, Tensor, D};
 use candle_nn::VarBuilder;
 
 use super::config::OmniConfig;
@@ -138,6 +140,16 @@ const TEXT_PAD_TOKEN_ID: i64 = 151859;
 /// decode on the wrong id made the Thinker always run to max_new tokens
 /// (runs 6-7: text_ids [1, 64]) and the Talker speak runaway text.
 const THINKER_CHAT_EOS_TOKEN_ID: i64 = 151645;
+
+/// Streaming decode constants. 50 codes = 2 s — the DiT's native
+/// block-causal chunk (`seconds_per_chunk = 2`, `position_id_per_seconds
+/// = 25`), so chunked windows are in-distribution. 25 codes (1 s) of left
+/// context anchor each chunk's prosody to what was already spoken;
+/// 1 200 samples = 50 ms of linear crossfade hide the noise-realization
+/// difference between consecutive flow-matching decodes.
+pub const STREAM_CHUNK_CODES: usize = 50;
+const CHUNK_CTX_CODES: usize = 25;
+const CROSSFADE_SAMPLES: usize = 1_200;
 
 /// The composed Qwen2.5-Omni model.
 #[derive(Debug)]
@@ -288,6 +300,60 @@ impl Qwen2_5OmniModel {
         sampling: TalkerSampling,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
+        // One-shot wrapper around the streaming path: collect every emitted
+        // chunk into a single waveform. `chunk_codes = 0` → a single decode
+        // over all codes, byte-identical to the historical behavior.
+        let mut samples: Vec<f32> = Vec::new();
+        let (gen_ids, codes_t) = self.generate_speech_streaming(
+            input_ids,
+            bos_token,
+            conditioning,
+            reference_mel,
+            thinker_max_new,
+            talker_max_new,
+            sampling,
+            cancel,
+            0,
+            &mut |chunk: &[f32]| {
+                samples.extend_from_slice(chunk);
+                Ok(())
+            },
+        )?;
+        let n = samples.len();
+        let wav = Tensor::from_vec(samples, (1, 1, n), gen_ids.device())?;
+        Ok((gen_ids, codes_t, wav))
+    }
+
+    /// Streaming text→speech: identical pipeline to [`Self::generate_speech`]
+    /// but audio is EMITTED INCREMENTALLY through `on_audio` instead of
+    /// returned at the end — this is what takes a realtime session's
+    /// first-audio latency from "whole utterance" to "first chunk".
+    ///
+    /// `chunk_codes` is the emission granularity in codec tokens: every
+    /// `chunk_codes` sampled codes (50 ≈ 2 s — the DiT's native
+    /// `seconds_per_chunk`), the window is decoded through Token2Wav and
+    /// the NEW samples are pushed to `on_audio`. `0` disables chunking
+    /// (single decode at the end).
+    ///
+    /// Chunked decodes use `CHUNK_CTX_CODES` of left context and a short
+    /// crossfade at each seam: consecutive chunks are decoded with fresh
+    /// flow-matching noise, so the boundary sample values differ slightly
+    /// — the held-back tail of the previous chunk is linearly blended with
+    /// the new decode's rendition of the same positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_speech_streaming(
+        &mut self,
+        input_ids: &Tensor,
+        bos_token: i64,
+        conditioning: &Tensor,
+        reference_mel: &Tensor,
+        thinker_max_new: usize,
+        talker_max_new: usize,
+        sampling: TalkerSampling,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        chunk_codes: usize,
+        on_audio: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<(Tensor, Tensor)> {
         use std::sync::atomic::Ordering;
         let cancelled =
             |c: Option<&std::sync::atomic::AtomicBool>| c.is_some_and(|f| f.load(Ordering::Relaxed));
@@ -414,6 +480,10 @@ impl Qwen2_5OmniModel {
         let mut codes: Vec<i64> = Vec::with_capacity(talker_max_new);
         let mut processor = sampling.make_processor();
         let rep_penalty = sampling.repetition_penalty;
+        // Streaming emission state: codes already decoded+emitted, plus the
+        // held-back tail awaiting the next chunk's crossfade partner.
+        let mut emitted_codes = 0usize;
+        let mut held_tail: Vec<f32> = Vec::new();
         // First chunk = the assembled prefill; replaced by the 1-token
         // chunk after each sampled code. `pos_offset` tracks the absolute
         // position of the chunk's first token.
@@ -464,6 +534,22 @@ impl Qwen2_5OmniModel {
             }
             codes.push(code);
 
+            // Streaming: a full chunk of fresh codes → decode + emit NOW,
+            // while the AR loop continues. This is where first-audio
+            // latency drops from whole-utterance to first-chunk.
+            if chunk_codes > 0 && codes.len() - emitted_codes >= chunk_codes {
+                self.decode_emit_chunk(
+                    &codes,
+                    &mut emitted_codes,
+                    &mut held_tail,
+                    conditioning,
+                    reference_mel,
+                    false,
+                    &device,
+                    on_audio,
+                )?;
+            }
+
             // next chunk = embed_codec(code) + reply_stream[0]  (2048-space)
             let code_t = Tensor::from_vec(vec![code], (1, 1), &device)?;
             let code_embed = self.talker.embed_codec(&code_t)?;
@@ -478,17 +564,99 @@ impl Qwen2_5OmniModel {
         }
         self.talker.clear_kv_cache();
 
-        let n = codes.len();
-        let codes_t = Tensor::from_vec(codes, (1, n), &device)?;
-
-        // ── 6. Token2Wav: codes → waveform. ───────────────────────────
+        // ── 6. Token2Wav: decode + emit whatever codes remain. ────────
         if cancelled(cancel) {
             candle::bail!("generation cancelled");
         }
+        self.decode_emit_chunk(
+            &codes,
+            &mut emitted_codes,
+            &mut held_tail,
+            conditioning,
+            reference_mel,
+            true,
+            &device,
+            on_audio,
+        )?;
+
+        let n = codes.len();
+        let codes_t = Tensor::from_vec(codes, (1, n), &device)?;
+        Ok((gen_ids, codes_t))
+    }
+
+    /// Decode the not-yet-emitted codes through Token2Wav (with
+    /// [`CHUNK_CTX_CODES`] of left context when this isn't the first
+    /// chunk) and push the NEW samples to `on_audio`, crossfading the
+    /// held-back tail of the previous chunk over [`CROSSFADE_SAMPLES`].
+    /// On `is_final` the tail is flushed instead of held.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_emit_chunk(
+        &self,
+        codes: &[i64],
+        emitted_codes: &mut usize,
+        held_tail: &mut Vec<f32>,
+        conditioning: &Tensor,
+        reference_mel: &Tensor,
+        is_final: bool,
+        device: &Device,
+        on_audio: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let end = codes.len();
+        if end == *emitted_codes {
+            if is_final && !held_tail.is_empty() {
+                let tail = std::mem::take(held_tail);
+                on_audio(&tail)?;
+            }
+            return Ok(());
+        }
+        let ctx = (*emitted_codes).min(CHUNK_CTX_CODES);
+        let window = &codes[*emitted_codes - ctx..end];
+        let w = window.len();
+        let window_t = Tensor::from_vec(window.to_vec(), (1, w), device)?;
         let wav = self
             .token2wav
-            .forward_default(&codes_t, conditioning, reference_mel)?;
-        Ok((gen_ids, codes_t, wav))
+            .forward_default(&window_t, conditioning, reference_mel)?;
+        let samples = wav.flatten_all()?.to_vec1::<f32>()?;
+        // Samples per code is fixed by the pipeline (2 mel frames × hop
+        // 240 = 480 @ 24 kHz) but derive it so config changes can't skew
+        // the seam arithmetic.
+        let spc = samples.len() / w;
+        let new_start = ctx * spc;
+
+        // Crossfade: the previous chunk held back its last F samples;
+        // this decode rendered the SAME positions at the end of its
+        // context region — blend linearly.
+        let f = held_tail.len();
+        if f > 0 && new_start >= f {
+            let alt = &samples[new_start - f..new_start];
+            let blended: Vec<f32> = held_tail
+                .iter()
+                .zip(alt.iter())
+                .enumerate()
+                .map(|(i, (&a, &b))| {
+                    let t = (i + 1) as f32 / (f + 1) as f32;
+                    a * (1.0 - t) + b * t
+                })
+                .collect();
+            on_audio(&blended)?;
+            held_tail.clear();
+        } else if f > 0 {
+            // Context too short to re-render the held positions — emit
+            // the held tail verbatim (no blend partner).
+            let tail = std::mem::take(held_tail);
+            on_audio(&tail)?;
+        }
+
+        let new = &samples[new_start..];
+        if is_final {
+            on_audio(new)?;
+        } else {
+            let hold = CROSSFADE_SAMPLES.min(new.len());
+            on_audio(&new[..new.len() - hold])?;
+            *held_tail = new[new.len() - hold..].to_vec();
+        }
+        *emitted_codes = end;
+        Ok(())
     }
 }
 
@@ -785,6 +953,78 @@ mod tests {
         assert!(dims[2] > 0, "empty waveform");
         let samples = wav.flatten_all()?.to_vec1::<f32>()?;
         assert!(samples.iter().all(|x| x.is_finite()), "non-finite audio");
+        Ok(())
+    }
+
+    /// **Streaming acceptance** — chunked emission must (a) fire the
+    /// callback more than once when codes exceed the chunk size, (b)
+    /// produce exactly as many total samples as the one-shot path for
+    /// the same greedy generation (values differ across decodes — fresh
+    /// flow-matching noise per chunk — but the seam arithmetic must not
+    /// drop or duplicate a single sample), and (c) stay finite.
+    #[test]
+    fn generate_speech_streaming_chunks_tiny() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_omni_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
+        let mut model = Qwen2_5OmniModel::new(&cfg, vb)?;
+        randomize(&vm, &device)?;
+
+        let input_ids = Tensor::from_vec(vec![1i64, 2, 3], (1, 3), &device)?;
+        let enc_emb_dim = cfg.token2wav_config.dit_config.enc_emb_dim;
+        let mel_dim = cfg.token2wav_config.dit_config.mel_dim;
+        let conditioning = Tensor::randn(0f32, 1f32, (1, enc_emb_dim), &device)?;
+        let reference_mel = Tensor::randn(0f32, 1f32, (1, 16, mel_dim), &device)?;
+
+        // One-shot reference (greedy → deterministic codes).
+        let (_, codes_a, wav) = model.generate_speech(
+            &input_ids,
+            1,
+            &conditioning,
+            &reference_mel,
+            4,
+            6,
+            TalkerSampling::GREEDY,
+            None,
+        )?;
+        let oneshot_len = wav.dim(2)?;
+
+        // Chunked: 2 codes per emission.
+        let mut emissions = 0usize;
+        let mut streamed: Vec<f32> = Vec::new();
+        let (_, codes_b) = model.generate_speech_streaming(
+            &input_ids,
+            1,
+            &conditioning,
+            &reference_mel,
+            4,
+            6,
+            TalkerSampling::GREEDY,
+            None,
+            2,
+            &mut |chunk: &[f32]| {
+                emissions += 1;
+                streamed.extend_from_slice(chunk);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(
+            codes_a.dims(),
+            codes_b.dims(),
+            "greedy code count must match across modes"
+        );
+        let n_codes = codes_b.dim(1)?;
+        if n_codes > 2 {
+            assert!(emissions > 1, "expected multiple emissions, got {emissions}");
+        }
+        assert_eq!(
+            streamed.len(),
+            oneshot_len,
+            "chunked emission dropped or duplicated samples"
+        );
+        assert!(streamed.iter().all(|x| x.is_finite()), "non-finite audio");
         Ok(())
     }
 

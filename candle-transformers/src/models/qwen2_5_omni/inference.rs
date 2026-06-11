@@ -182,6 +182,9 @@ impl Qwen2_5OmniModel {
     pub fn thinker(&self) -> &Thinker {
         &self.thinker
     }
+    pub fn thinker_mut(&mut self) -> &mut Thinker {
+        &mut self.thinker
+    }
     pub fn talker(&self) -> &Talker {
         &self.talker
     }
@@ -907,7 +910,7 @@ mod tests {
             VarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)
                 .expect("mmap safetensors")
         };
-        let model = Qwen2_5OmniModel::new(&cfg, vb).expect("construct full Omni model");
+        let mut model = Qwen2_5OmniModel::new(&cfg, vb).expect("construct full Omni model");
 
         // Stub codes → audio. Synthetic speaker conditioning + reference
         // mel (a real run would pull these from spk_dict.pt). Keep codes
@@ -944,7 +947,7 @@ mod tests {
         // Also exercise the Thinker text path on the same loaded model.
         let input_ids = Tensor::from_vec(vec![151644i64, 151645, 100, 200], (1, 4), &device).unwrap();
         let logits = model
-            .thinker()
+            .thinker_mut()
             .forward_text_only(&input_ids, 0)
             .expect("thinker forward");
         assert_eq!(logits.dim(2).unwrap(), model.thinker().config().vocab_size);

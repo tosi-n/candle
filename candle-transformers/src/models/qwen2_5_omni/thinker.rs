@@ -51,6 +51,9 @@ struct Attention {
     n_kv_heads: usize,
     head_dim: usize,
     rotary: std::sync::Arc<MRopeTable>,
+    /// Per-layer KV cache for incremental decode: post-RoPE,
+    /// pre-`repeat_kv` (k, v), each `(B, n_kv_heads, L, head_dim)`.
+    kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl Attention {
@@ -73,12 +76,14 @@ impl Attention {
             n_kv_heads,
             head_dim,
             rotary,
+            kv_cache: None,
         })
     }
 
-    /// `x: (B, S, hidden)`, `position_ids: (3, B, S)`.
-    /// Returns `(B, S, hidden)`.
-    fn forward(&self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+    /// `x: (B, S, hidden)`, `position_ids: (3, B, S)` carrying ABSOLUTE
+    /// positions. Appends this chunk's (k, v) to the per-layer cache so
+    /// decode steps pass one new token. Returns `(B, S, hidden)`.
+    fn forward(&mut self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         // Project + reshape to (B, H, S, head_dim).
         let q = self
@@ -103,6 +108,17 @@ impl Attention {
         // M-RoPE applied to q + k.
         let (q, k) = self.rotary.apply(&q, &k, position_ids)?;
 
+        // KV cache append (decode steps carry one token; prefill carries
+        // the whole prompt with an empty cache).
+        let (k, v) = match &self.kv_cache {
+            None => (k, v),
+            Some((pk, pv)) => (
+                Tensor::cat(&[pk, &k], 2)?.contiguous()?,
+                Tensor::cat(&[pv, &v], 2)?.contiguous()?,
+            ),
+        };
+        self.kv_cache = Some((k.clone(), v.clone()));
+
         // GQA: repeat kv heads to match q heads.
         let groups = self.n_heads / self.n_kv_heads;
         let k = if groups > 1 { repeat_kv(&k, groups)? } else { k };
@@ -124,6 +140,10 @@ impl Attention {
             .reshape((b, s, self.n_heads * self.head_dim))?;
         self.o_proj.forward(&attn)
     }
+
+    fn clear_kv_cache(&mut self) {
+        self.kv_cache = None;
+    }
 }
 
 /// Repeat each KV head `groups` times along the head axis to match q
@@ -139,15 +159,21 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 /// `-inf` above. Broadcasts over batch+head when added to scores
 /// `(B, H, S, S)`.
 fn apply_causal_mask(scores: &Tensor) -> Result<Tensor> {
-    let s = scores.dim(D::Minus1)?;
+    let q = scores.dim(D::Minus2)?;
+    let kv = scores.dim(D::Minus1)?;
+    if q == 1 {
+        // A single decode step attends the whole cache — no mask.
+        return Ok(scores.clone());
+    }
+    let offset = kv - q;
     let device = scores.device();
-    let mut row = Vec::with_capacity(s * s);
-    for i in 0..s {
-        for j in 0..s {
-            row.push(if j > i { f32::NEG_INFINITY } else { 0f32 });
+    let mut row = Vec::with_capacity(q * kv);
+    for i in 0..q {
+        for j in 0..kv {
+            row.push(if j > i + offset { f32::NEG_INFINITY } else { 0f32 });
         }
     }
-    let mask = Tensor::from_vec(row, (s, s), device)?
+    let mask = Tensor::from_vec(row, (q, kv), device)?
         .unsqueeze(0)?
         .unsqueeze(0)?;
     scores.broadcast_add(&mask)
@@ -211,7 +237,7 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+    fn forward(&mut self, x: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
         let residual = x;
         let h = self.input_layernorm.forward(x)?;
         let h = self.self_attn.forward(&h, position_ids)?;
@@ -220,6 +246,10 @@ impl DecoderLayer {
         let h = self.post_attention_layernorm.forward(&x)?;
         let h = self.mlp.forward(&h)?;
         residual + &h
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -299,15 +329,37 @@ impl Thinker {
     /// full causal forward. KV-cached generation lands in Phase 3
     /// alongside the Talker decode loop (the two share the same Qwen2
     /// decoder pattern + cache infra).
-    pub fn forward_text_only(&self, input_ids: &Tensor, offset: usize) -> Result<Tensor> {
+    pub fn forward_text_only(&mut self, input_ids: &Tensor, offset: usize) -> Result<Tensor> {
+        // Stateless semantics preserved: every call starts from an empty
+        // cache (callers that want incremental decode use
+        // `forward_text_only_cached` and manage clearing themselves).
+        self.clear_kv_cache();
+        self.forward_text_only_cached(input_ids, offset)
+    }
+
+    /// KV-cached forward chunk: appends to the per-layer cache, so a
+    /// decode step passes ONE token with its absolute `offset`. Callers
+    /// MUST `clear_kv_cache` before a new sequence.
+    pub fn forward_text_only_cached(
+        &mut self,
+        input_ids: &Tensor,
+        offset: usize,
+    ) -> Result<Tensor> {
         let (b, s) = input_ids.dims2()?;
         let mut h = self.embed_tokens.forward(input_ids)?;
         let position_ids = text_only_position_ids(b, s, offset, h.device())?;
-        for layer in &self.layers {
+        for layer in &mut self.layers {
             h = layer.forward(&h, &position_ids)?;
         }
         let h = self.norm.forward(&h)?;
         self.lm_head.forward(&h)
+    }
+
+    /// Reset all per-layer KV caches — MUST run before every new sequence.
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.clear_kv_cache();
+        }
     }
 
     /// Variant that accepts pre-spliced `inputs_embeds: (B, S, hidden)`
@@ -317,12 +369,13 @@ impl Thinker {
     /// position-id construction is the responsibility of the caller;
     /// for now we accept arbitrary `position_ids: (3, B, S)`.
     pub fn forward_with_embeds(
-        &self,
+        &mut self,
         inputs_embeds: &Tensor,
         position_ids: &Tensor,
     ) -> Result<Tensor> {
+        self.clear_kv_cache();
         let mut h = inputs_embeds.clone();
-        for layer in &self.layers {
+        for layer in &mut self.layers {
             h = layer.forward(&h, position_ids)?;
         }
         let h = self.norm.forward(&h)?;
@@ -344,27 +397,35 @@ impl Thinker {
     ///
     /// Returns ONLY the newly-generated ids `(1, G)` (G may be 0 if the
     /// very first sampled token is `eos`). Batch size 1.
-    pub fn generate_greedy(&self, input_ids: &Tensor, max_new: usize, eos: i64) -> Result<Tensor> {
-        let (b, _) = input_ids.dims2()?;
+    pub fn generate_greedy(
+        &mut self,
+        input_ids: &Tensor,
+        max_new: usize,
+        eos: i64,
+    ) -> Result<Tensor> {
+        let (b, prompt_len) = input_ids.dims2()?;
         if b != 1 {
             candle::bail!("generate_greedy: batch size must be 1, got {b}");
         }
         let device = input_ids.device().clone();
-        let mut all: Vec<i64> = input_ids.flatten_all()?.to_vec1::<i64>()?;
+        // KV-cached: prefill once, then ONE token per step with its
+        // absolute position — O(N) forwards instead of the previous
+        // full-recompute O(N²).
+        self.clear_kv_cache();
         let mut gen: Vec<i64> = Vec::with_capacity(max_new);
-        for _ in 0..max_new {
-            let cur = Tensor::from_vec(all.clone(), (1, all.len()), &device)?;
-            let logits = self.forward_text_only(&cur, 0)?;
+        let mut logits = self.forward_text_only_cached(input_ids, 0)?;
+        for step in 0..max_new {
             let s = logits.dim(1)?;
-            // Last-position logits → argmax.
             let last = logits.i((0, s - 1, ..))?.to_dtype(DType::F32)?;
             let next = argmax_i64(&last)?;
             gen.push(next);
-            all.push(next);
-            if next == eos {
+            if next == eos || step + 1 == max_new {
                 break;
             }
+            let tok = Tensor::from_vec(vec![next], (1, 1), &device)?;
+            logits = self.forward_text_only_cached(&tok, prompt_len + step)?;
         }
+        self.clear_kv_cache();
         let g = gen.len();
         Tensor::from_vec(gen, (1, g), &device)
     }
@@ -381,12 +442,13 @@ impl Thinker {
     /// in one pass over `[prompt + generated]` is identical to
     /// capturing them step-by-step during generation (upstream's
     /// approach), which is the simplification the orchestrator relies on.
-    pub fn forward_collect(&self, input_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn forward_collect(&mut self, input_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.clear_kv_cache();
         let (b, s) = input_ids.dims2()?;
         let tok_embeds = self.embed_tokens.forward(input_ids)?;
         let position_ids = text_only_position_ids(b, s, 0, tok_embeds.device())?;
         let mut h = tok_embeds.clone();
-        for layer in &self.layers {
+        for layer in &mut self.layers {
             h = layer.forward(&h, &position_ids)?;
         }
         let last_hidden = self.norm.forward(&h)?;
@@ -458,13 +520,51 @@ mod tests {
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
-        let thinker = Thinker::new(&cfg, vb)?;
+        let mut thinker = Thinker::new(&cfg, vb)?;
         randomize(&vm, &device)?;
 
         let input_ids = Tensor::from_vec(vec![1i64, 2, 3, 4, 5], (1, 5), &device)?;
         let logits = thinker.forward_text_only(&input_ids, 0)?;
         assert_eq!(logits.dims(), &[1, 5, cfg.vocab_size]);
         assert!(logits.flatten_all()?.to_vec1::<f32>()?.iter().all(|x| x.is_finite()));
+        Ok(())
+    }
+
+    /// **KV-cache equivalence** — the cached greedy loop must emit the
+    /// SAME token sequence as a manual full-recompute loop (causal
+    /// attention with absolute positions makes them mathematically
+    /// identical; this guards the cache/mask/offset arithmetic).
+    #[test]
+    fn cached_greedy_matches_full_recompute() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &device);
+        let mut thinker = Thinker::new(&cfg, vb)?;
+        randomize(&vm, &device)?;
+
+        let input_ids = Tensor::from_vec(vec![1i64, 2, 3], (1, 3), &device)?;
+        let max_new = 6;
+        let eos = -1; // never fires — force max_new tokens both ways
+
+        let cached = thinker
+            .generate_greedy(&input_ids, max_new, eos)?
+            .flatten_all()?
+            .to_vec1::<i64>()?;
+
+        // Manual full-recompute reference.
+        let mut all: Vec<i64> = input_ids.flatten_all()?.to_vec1::<i64>()?;
+        let mut reference: Vec<i64> = Vec::new();
+        for _ in 0..max_new {
+            let cur = Tensor::from_vec(all.clone(), (1, all.len()), &device)?;
+            let logits = thinker.forward_text_only(&cur, 0)?;
+            let s = logits.dim(1)?;
+            let last = logits.i((0, s - 1, ..))?.to_dtype(DType::F32)?;
+            let next = argmax_i64(&last)?;
+            reference.push(next);
+            all.push(next);
+        }
+        assert_eq!(cached, reference, "cached greedy diverged from full recompute");
         Ok(())
     }
 
@@ -566,7 +666,7 @@ mod tests {
             VarBuilder::from_mmaped_safetensors(&shards, DType::F32, &device)
                 .expect("mmap safetensors")
         };
-        let thinker = Thinker::new(&cfg.thinker_config.text_config, vb.pp("thinker"))
+        let mut thinker = Thinker::new(&cfg.thinker_config.text_config, vb.pp("thinker"))
             .expect("construct Thinker from real weights");
 
         // Tiny forward: a 4-token prompt.
@@ -620,7 +720,7 @@ mod tests {
             VarBuilder::from_mmaped_safetensors(&shards, DType::BF16, &device)
                 .expect("mmap safetensors")
         };
-        let thinker = Thinker::new(&cfg.thinker_config.text_config, vb.pp("thinker"))
+        let mut thinker = Thinker::new(&cfg.thinker_config.text_config, vb.pp("thinker"))
             .expect("construct Thinker from real weights");
 
         let input_ids = Tensor::from_vec(vec![151644i64, 151645, 100, 200], (1, 4), &device)

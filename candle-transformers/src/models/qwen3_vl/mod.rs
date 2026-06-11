@@ -6,7 +6,9 @@ use text::Qwen3VLTextModel;
 use vision::Qwen3VLVisionModel;
 
 pub mod config;
-mod conv3d_temporal_2;
+// Promoted to `pub` so sibling models (e.g. `qwen2_5_omni`) can reuse the
+// temporal=2 Conv3d wrapper without duplicating it.
+pub mod conv3d_temporal_2;
 mod text;
 mod vision;
 

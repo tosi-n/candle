@@ -354,6 +354,52 @@ impl Qwen2_5OmniModel {
         chunk_codes: usize,
         on_audio: &mut dyn FnMut(&[f32]) -> Result<()>,
     ) -> Result<(Tensor, Tensor)> {
+        // ── 1. Thinker greedy text generation (stops on `<|im_end|>`). ─
+        let gen_ids = self.thinker_reply(input_ids, thinker_max_new)?;
+        let codes_t = self.speak_reply_streaming(
+            input_ids,
+            &gen_ids,
+            bos_token,
+            conditioning,
+            reference_mel,
+            talker_max_new,
+            sampling,
+            cancel,
+            chunk_codes,
+            on_audio,
+        )?;
+        Ok((gen_ids, codes_t))
+    }
+
+    /// Stage 1 alone: greedy Thinker text generation (stops on
+    /// `<|im_end|>`). Exposed separately so callers can INSPECT the reply
+    /// text between the stages — e.g. parse a `<tool_call>` block and skip
+    /// (or trim) speech instead of reading JSON aloud — then feed the ids
+    /// they actually want spoken to [`Self::speak_reply_streaming`].
+    pub fn thinker_reply(&mut self, input_ids: &Tensor, thinker_max_new: usize) -> Result<Tensor> {
+        self.thinker
+            .generate_greedy(input_ids, thinker_max_new, THINKER_CHAT_EOS_TOKEN_ID)
+    }
+
+    /// Stages 2-6: speak `gen_ids` as the assistant reply to `input_ids`.
+    /// `gen_ids` is usually [`Self::thinker_reply`]'s output, but ANY token
+    /// sequence works — the fused hiddens are recomputed by one causal
+    /// forward over `[prompt + gen_ids]`, so e.g. a tool-call preamble
+    /// trimmed out of the raw reply speaks naturally.
+    #[allow(clippy::too_many_arguments)]
+    pub fn speak_reply_streaming(
+        &mut self,
+        input_ids: &Tensor,
+        gen_ids: &Tensor,
+        bos_token: i64,
+        conditioning: &Tensor,
+        reference_mel: &Tensor,
+        talker_max_new: usize,
+        sampling: TalkerSampling,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        chunk_codes: usize,
+        on_audio: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<Tensor> {
         use std::sync::atomic::Ordering;
         let cancelled =
             |c: Option<&std::sync::atomic::AtomicBool>| c.is_some_and(|f| f.load(Ordering::Relaxed));
@@ -363,14 +409,9 @@ impl Qwen2_5OmniModel {
         }
         let device = input_ids.device().clone();
 
-        // ── 1. Thinker greedy text generation (stops on `<|im_end|>`). ─
-        let gen_ids = self
-            .thinker
-            .generate_greedy(input_ids, thinker_max_new, THINKER_CHAT_EOS_TOKEN_ID)?;
-
         // ── 2. ONE full forward over [prompt + generated], capturing
         //       layer-0 embeds + final hidden for ALL positions. ────────
-        let full_ids = Tensor::cat(&[input_ids, &gen_ids], D::Minus1)?;
+        let full_ids = Tensor::cat(&[input_ids, gen_ids], D::Minus1)?;
         let (last_hidden, tok_embeds) = self.thinker.forward_collect(&full_ids)?;
         // ── 3. FUSION — prompt prefix + generated reply (upstream 3890–3976). ──
         //
@@ -581,7 +622,7 @@ impl Qwen2_5OmniModel {
 
         let n = codes.len();
         let codes_t = Tensor::from_vec(codes, (1, n), &device)?;
-        Ok((gen_ids, codes_t))
+        Ok(codes_t)
     }
 
     /// Decode the not-yet-emitted codes through Token2Wav (with

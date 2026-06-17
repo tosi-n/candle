@@ -1411,6 +1411,60 @@ fn simple_eval_(
                 };
                 values.insert(node.output[0].clone(), output);
             }
+            // https://onnx.ai/onnx/operators/onnx__ReduceProd.html
+            "ReduceProd" => {
+                let input = get(&node.input[0])?;
+                let keepdims = get_attr_opt::<i64>(node, "keepdims")?.copied().unwrap_or(1);
+                let n_dims = input.dims().len();
+
+                // axes: attribute (opset <= 17) or optional input (opset >= 18);
+                // absent => reduce over every dimension.
+                let axes: Vec<usize> = if let Some(axes) = get_attr_opt::<[i64]>(node, "axes")? {
+                    axes.iter()
+                        .map(|e| (if *e < 0 { n_dims as i64 + *e } else { *e }) as usize)
+                        .collect()
+                } else {
+                    match get_opt(1) {
+                        Some(Ok(axes)) => axes
+                            .to_vec1::<i64>()?
+                            .into_iter()
+                            .map(|e| (if e < 0 { n_dims as i64 + e } else { e }) as usize)
+                            .collect(),
+                        Some(Err(_)) | None => (0..n_dims).collect(),
+                    }
+                };
+
+                // candle has no product reduction; fold each axis with
+                // elementwise multiply. Work in f64 so integer shape arithmetic
+                // (the common use: product of a shape vector) stays exact, then
+                // restore the original dtype.
+                let dtype = input.dtype();
+                let mut acc = input.to_dtype(DType::F64)?;
+                for &ax in axes.iter() {
+                    let sz = acc.dim(ax)?;
+                    if sz == 0 {
+                        let mut shape = acc.dims().to_vec();
+                        shape[ax] = 1;
+                        acc = Tensor::ones(shape, DType::F64, acc.device())?;
+                        continue;
+                    }
+                    let mut prod = acc.narrow(ax, 0, 1)?;
+                    for i in 1..sz {
+                        prod = (prod * acc.narrow(ax, i, 1)?)?;
+                    }
+                    acc = prod;
+                }
+                let mut acc = acc.to_dtype(dtype)?;
+                if keepdims == 0 {
+                    let mut sorted = axes.clone();
+                    sorted.sort_unstable_by(|a, b| b.cmp(a));
+                    sorted.dedup();
+                    for ax in sorted {
+                        acc = acc.squeeze(ax)?;
+                    }
+                }
+                values.insert(node.output[0].clone(), acc);
+            }
             // https://onnx.ai/onnx/operators/onnx__ReduceMin.html#reducemin
             "ReduceMin" => {
                 let input = get(&node.input[0])?;
